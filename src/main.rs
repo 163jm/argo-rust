@@ -6,16 +6,14 @@ mod proxy;
 mod rpc;
 mod tunnel;
 
+use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(
-    name = "mini-cloudflared",
-    version = "0.3.0",
-    about = "Minimal Cloudflare Tunnel client – routes configured in Cloudflare dashboard"
-)]
+#[command(name = "mini-cloudflared", version = "0.4.0",
+    about = "Minimal Cloudflare Tunnel client")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -23,14 +21,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Connect to Cloudflare using a tunnel token (routes from dashboard)
+    /// Connect to Cloudflare using a tunnel token
     Tunnel {
-        /// Tunnel token from Cloudflare dashboard → Networks → Tunnels → your tunnel → Token
+        /// Tunnel token (from Cloudflare dashboard → Networks → Tunnels → Token)
         #[arg(short, long, env = "TUNNEL_TOKEN")]
         token: String,
+
+        /// Path to ingress config file (default: ~/.cloudflared/config.yaml)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 
-    /// Start a local TCP reverse proxy (optional helper)
+    /// Start a local TCP reverse proxy
     Proxy {
         #[arg(short, long, default_value = "8080")]
         port: u16,
@@ -38,7 +40,7 @@ enum Commands {
         target: String,
     },
 
-    /// Show version and protocol info
+    /// Show version and usage info
     Info,
 }
 
@@ -52,32 +54,30 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Commands::Tunnel { token } => {
+        Commands::Tunnel { token, config } => {
             tunnel::run_tunnel(config::TunnelConfig {
                 token,
                 quick_tunnel: false,
-            })
-            .await?;
+                config_file: config,
+            }).await?;
         }
         Commands::Proxy { port, target } => {
             proxy::run_proxy(port, target).await?;
         }
         Commands::Info => {
-            println!("mini-cloudflared v0.3.0");
-            println!("Protocol : HTTP/2 over TLS (port 7844)");
-            println!("Edge SNI : h2.cftunnel.com");
-            println!("Edge DNS : region1.v2.argotunnel.com");
-            println!("Routes   : fetched from Cloudflare API, refreshed every 30s");
-            println!();
+            println!("mini-cloudflared v0.4.0\n");
             println!("Usage:");
             println!("  mini-cloudflared tunnel --token <TOKEN>");
-            println!("  TUNNEL_TOKEN=<TOKEN> mini-cloudflared tunnel");
-            println!();
-            println!("Routes are configured in:");
-            println!("  Cloudflare dashboard → Zero Trust → Networks → Tunnels");
-            println!("  → your tunnel → Public Hostname tab");
+            println!("  mini-cloudflared tunnel --token <TOKEN> --config /path/to/config.yaml");
+            println!("  TUNNEL_TOKEN=<TOKEN> mini-cloudflared tunnel\n");
+            println!("Config file (~/.cloudflared/config.yaml):");
+            println!("  ingress:");
+            println!("    - hostname: example.com");
+            println!("      service: http://localhost:8080");
+            println!("    - hostname: api.example.com");
+            println!("      service: http://localhost:3000");
+            println!("    - service: http_status:404   # catch-all required");
         }
     }
-
     Ok(())
 }

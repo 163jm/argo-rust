@@ -1,74 +1,119 @@
-//! Fetch and manage ingress rules from Cloudflare API
+//! Ingress rule management
 //!
-//! GET https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations
+//! Rules are loaded from a local config file (YAML/JSON), same format as
+//! official cloudflared. No Cloudflare API call needed.
+//!
+//! Example config.yaml:
+//!   ingress:
+//!     - hostname: example.com
+//!       service: http://localhost:8080
+//!     - hostname: api.example.com
+//!       service: http://localhost:3000
+//!     - service: http_status:404   # catch-all (required)
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::{Context, Result};
-use tracing::{info, warn, debug};
+use serde::Deserialize;
+use tracing::{info, warn};
 
-use crate::config::{IngressRule, TokenCreds, TunnelConfiguration};
+use crate::config::IngressRule;
 
-const CF_API: &str = "https://api.cloudflare.com/client/v4";
-
-/// Shared, hot-reloadable ingress table
 pub type IngressTable = Arc<RwLock<Vec<IngressRule>>>;
 
-/// Fetch ingress rules from Cloudflare API using the tunnel token as Bearer auth.
-/// The token inside the decoded credentials acts as the API credential.
-pub async fn fetch_ingress(creds: &TokenCreds, raw_token: &str) -> Result<Vec<IngressRule>> {
-    let url = format!(
-        "{}/accounts/{}/cfd_tunnel/{}/configurations",
-        CF_API, creds.a, creds.t
-    );
-    debug!("Fetching tunnel config from: {}", url);
+// ── Config file format ─────────────────────────────────────────────────────
 
-    // Use the original raw token as Bearer (Cloudflare accepts it for tunnel auth)
-    let client = build_http_client()?;
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", raw_token))
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .context("Failed to call Cloudflare API")?;
+#[derive(Debug, Deserialize)]
+struct ConfigFile {
+    ingress: Vec<IngressRule>,
+}
 
-    let status = resp.status();
-    let body = resp.text().await?;
+/// Load ingress rules from a YAML or JSON config file
+pub fn load_from_file(path: &Path) -> Result<Vec<IngressRule>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot read config file: {}", path.display()))?;
 
-    if !status.is_success() {
-        anyhow::bail!("Cloudflare API error {}: {}", status, body);
+    // Try YAML first, then JSON
+    let cfg: ConfigFile = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        serde_json::from_str(&content)
+            .with_context(|| format!("Invalid JSON in {}", path.display()))?
+    } else {
+        serde_yaml::from_str(&content)
+            .with_context(|| format!("Invalid YAML in {}", path.display()))?
+    };
+
+    validate_rules(&cfg.ingress)?;
+    Ok(cfg.ingress)
+}
+
+fn validate_rules(rules: &[IngressRule]) -> Result<()> {
+    if rules.is_empty() {
+        anyhow::bail!("Config file has no ingress rules");
     }
-
-    debug!("Config API response: {}", &body[..body.len().min(500)]);
-
-    // Response: { "result": { "config": { "ingress": [...] } }, "success": true }
-    #[derive(serde::Deserialize)]
-    struct ApiResponse {
-        result: Option<TunnelConfiguration>,
-        success: bool,
-        errors: Option<Vec<serde_json::Value>>,
+    // Last rule must be a catch-all (no hostname)
+    let last = rules.last().unwrap();
+    if !last.hostname.is_empty() {
+        anyhow::bail!(
+            "Last ingress rule must be a catch-all (no hostname). Add:\n  - service: http_status:404"
+        );
     }
+    Ok(())
+}
 
-    let parsed: ApiResponse = serde_json::from_str(&body)
-        .context("Failed to parse Cloudflare API response")?;
-
-    if !parsed.success {
-        anyhow::bail!("Cloudflare API returned success=false: {:?}", parsed.errors);
+/// Find default config file location:
+///   1. ~/.cloudflared/config.yaml
+///   2. /etc/cloudflared/config.yaml
+pub fn default_config_path() -> Option<PathBuf> {
+    if let Some(home) = dirs_next::home_dir() {
+        let p = home.join(".cloudflared").join("config.yaml");
+        if p.exists() { return Some(p); }
+        let p = home.join(".cloudflared").join("config.json");
+        if p.exists() { return Some(p); }
     }
+    let p = PathBuf::from("/etc/cloudflared/config.yaml");
+    if p.exists() { return Some(p); }
+    None
+}
 
-    let rules = parsed
-        .result
-        .map(|r| r.config.ingress)
-        .unwrap_or_default();
+/// Build an IngressTable from rules
+pub fn make_table(rules: Vec<IngressRule>) -> IngressTable {
+    Arc::new(RwLock::new(rules))
+}
 
-    info!("Loaded {} ingress rule(s) from Cloudflare", rules.len());
+/// Spawn a background task that reloads config file every `interval` seconds
+pub fn start_reload_task(path: PathBuf, table: IngressTable, interval_secs: u64) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+            match load_from_file(&path) {
+                Ok(rules) => {
+                    *table.write().await = rules;
+                    info!("Ingress rules reloaded from {}", path.display());
+                }
+                Err(e) => {
+                    warn!("Failed to reload config: {}", e);
+                }
+            }
+        }
+    });
+}
+
+/// Match a request against the ingress table → first matching rule wins
+pub async fn resolve(table: &IngressTable, host: &str, path: &str) -> Option<IngressRule> {
+    let rules = table.read().await;
+    rules.iter().find(|r| r.matches(host, path)).cloned()
+}
+
+/// Print loaded rules to stdout
+pub fn print_rules(rules: &[IngressRule]) {
+    info!("Loaded {} ingress rule(s):", rules.len());
     for (i, rule) in rules.iter().enumerate() {
         if rule.hostname.is_empty() {
             info!("  Rule {}: (catch-all) → {}", i + 1, rule.service);
         } else {
             info!(
-                "  Rule {}: {}{}  → {}",
+                "  Rule {}: {}{}  →  {}",
                 i + 1,
                 rule.hostname,
                 if rule.path.is_empty() { String::new() } else { format!("/{}", rule.path) },
@@ -76,42 +121,4 @@ pub async fn fetch_ingress(creds: &TokenCreds, raw_token: &str) -> Result<Vec<In
             );
         }
     }
-
-    Ok(rules)
-}
-
-/// Spawn a background task that refreshes ingress rules every `interval` seconds
-pub fn start_refresh_task(
-    creds: TokenCreds,
-    raw_token: String,
-    table: IngressTable,
-    interval_secs: u64,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-            match fetch_ingress(&creds, &raw_token).await {
-                Ok(rules) => {
-                    *table.write().await = rules;
-                    info!("Ingress rules refreshed");
-                }
-                Err(e) => {
-                    warn!("Failed to refresh ingress rules: {}", e);
-                }
-            }
-        }
-    });
-}
-
-/// Match a request (host + path) against the ingress table, return the winning rule
-pub async fn resolve(table: &IngressTable, host: &str, path: &str) -> Option<IngressRule> {
-    let rules = table.read().await;
-    rules.iter().find(|r| r.matches(host, path)).cloned()
-}
-
-fn build_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("Failed to build HTTP client")
 }
