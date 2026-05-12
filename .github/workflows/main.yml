@@ -30,21 +30,6 @@ jobs:
             os: ubuntu-latest
             artifact: mini-cloudflared-linux-arm64
 
-          # macOS amd64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: mini-cloudflared-macos-amd64
-
-          # macOS arm64 (Apple Silicon)
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: mini-cloudflared-macos-arm64
-
-          # Windows amd64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: mini-cloudflared-windows-amd64.exe
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
