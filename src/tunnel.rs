@@ -1,16 +1,13 @@
-//! Cloudflare Tunnel HTTP/2 transport implementation
+//! Cloudflare Tunnel HTTP/2 transport
 //!
-//! Protocol summary (HTTP/2 over TLS on port 7844):
-//!
-//! 1. TLS connect to edge IP:7844 with SNI "h2.cftunnel.com"
-//! 2. Upgrade to HTTP/2 (h2 crate client mode, but acting as server)
-//! 3. Open a "control stream" to register the tunnel:
-//!      POST /<tunnel-id> HTTP/2
-//!      Cf-Cloudflared-Proxy-Connection-Upgrade: control-stream
-//!      Body: JSON RegisterConnectionRequest
-//! 4. Edge pushes requests as HTTP/2 streams to us (we are the HTTP/2 "server")
-//!      Each incoming stream is a proxied request from the Internet
-//!      We forward to origin and write response back on the same stream
+//! Flow:
+//!  1. Decode token → account_tag, tunnel_secret, tunnel_id
+//!  2. Fetch ingress rules from Cloudflare REST API
+//!  3. Resolve edge IPs via DNS (region1.v2.argotunnel.com:7844)
+//!  4. TLS connect with SNI "h2.cftunnel.com", ALPN "h2"
+//!  5. HTTP/2 handshake (we act as h2 server; edge is the client)
+//!  6. First stream from edge = control stream → reply with RegisterConnection JSON
+//!  7. Subsequent streams = proxied requests → match ingress, forward to origin
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,96 +26,49 @@ use uuid::Uuid;
 
 use crate::config::{TokenCreds, TunnelConfig};
 use crate::edge::{resolve_edge_addrs, EDGE_SNI};
-use crate::origin::{bad_gateway, forward_http};
+use crate::ingress::{fetch_ingress, start_refresh_task, resolve, IngressTable};
+use crate::origin::{bad_gateway, dispatch, not_found};
 use crate::rpc::{ClientInfo, ConnectionOptions, RegisterConnectionRequest};
 
-// ── Headers used by cloudflared protocol ──────────────────────────────────
 const HDR_UPGRADE: &str = "cf-cloudflared-proxy-connection-upgrade";
 const HDR_RESP_HEADERS: &str = "cf-cloudflared-proxy-response-headers";
 const CONTROL_STREAM: &str = "control-stream";
+/// Ingress rules are refreshed from Cloudflare API every 30 seconds
+const REFRESH_INTERVAL: u64 = 30;
 
-// ── Public entry point ─────────────────────────────────────────────────────
+// ── Entry point ────────────────────────────────────────────────────────────
 
 pub async fn run_tunnel(cfg: TunnelConfig) -> Result<()> {
-    if cfg.quick_tunnel {
-        run_quick_tunnel(&cfg).await
-    } else if let Some(token) = &cfg.token {
-        let creds = TokenCreds::from_token(token)
-            .context("Failed to decode tunnel token")?;
-        info!("Tunnel ID  : {}", creds.t);
-        info!("Account Tag: {}", creds.a);
-        run_named_tunnel(cfg, creds).await
-    } else {
-        bail!("Provide --token <TOKEN> or --quick");
-    }
-}
+    let creds = TokenCreds::from_token(&cfg.token)
+        .context("Failed to decode tunnel token – is it the token from the Cloudflare dashboard?")?;
 
-// ── Quick tunnel (trycloudflare.com) ───────────────────────────────────────
+    info!("Tunnel ID  : {}", creds.t);
+    info!("Account    : {}", creds.a);
 
-async fn run_quick_tunnel(cfg: &TunnelConfig) -> Result<()> {
-    info!("Starting quick tunnel for {}", cfg.local_url);
+    // Fetch ingress rules from Cloudflare API
+    info!("Fetching ingress rules from Cloudflare API…");
+    let rules = fetch_ingress(&creds, &cfg.token).await
+        .context("Failed to fetch tunnel configuration from Cloudflare API")?;
 
-    // POST to Cloudflare quick-tunnel API
-    let addrs = resolve_edge_addrs().await?;
-    let connector_id = Uuid::new_v4();
+    let table: IngressTable = Arc::new(tokio::sync::RwLock::new(rules));
 
-    let tls = make_tls_config()?;
-    let connector = TlsConnector::from(Arc::new(tls));
+    // Start background refresh task
+    start_refresh_task(creds.clone(), cfg.token.clone(), Arc::clone(&table), REFRESH_INTERVAL);
 
-    let mut last_err: Option<anyhow::Error> = None;
-    for addr in &addrs {
-        match try_quick_connect(*addr, connector_id, cfg, &connector).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                warn!("Quick tunnel attempt to {} failed: {}", addr, e);
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No edge addresses available")))
-}
-
-async fn try_quick_connect(
-    addr: SocketAddr,
-    connector_id: Uuid,
-    cfg: &TunnelConfig,
-    connector: &TlsConnector,
-) -> Result<()> {
-    debug!("Connecting to edge {} (quick tunnel)", addr);
-    let tcp = TcpStream::connect(addr).await?;
-    let domain = rustls::ServerName::try_from(EDGE_SNI)?;
-    let tls = connector.connect(domain, tcp).await?;
-
-    // h2 handshake – we act as HTTP/2 server (edge calls us)
-    let mut h2 = h2::server::handshake(tls).await?;
-    info!("HTTP/2 connected to edge {}", addr);
-
-    // First, open the control stream to register
-    // Actually in h2 server mode, the edge opens streams to us.
-    // We need to handle incoming streams and identify the control stream.
-    // But for quick tunnels, the edge first asks us to register via an
-    // HTTP POST to our "server" handle.
-
-    // Wait for the edge to send the control stream request
-    serve_h2(&mut h2, connector_id, None, &cfg.local_url, addr).await
-}
-
-// ── Named tunnel ───────────────────────────────────────────────────────────
-
-async fn run_named_tunnel(cfg: TunnelConfig, creds: TokenCreds) -> Result<()> {
-    info!("Starting named tunnel → {}", cfg.local_url);
-
+    // Resolve edge addresses
     let addrs = resolve_edge_addrs().await?;
     if addrs.is_empty() {
         bail!("Could not resolve any Cloudflare edge addresses");
     }
+    info!("Resolved {} edge address(es)", addrs.len());
 
     let tls = make_tls_config()?;
     let connector = TlsConnector::from(Arc::new(tls));
     let connector_id = Uuid::new_v4();
-    info!("Connector ID: {}", connector_id);
+    info!("Connector  : {}", connector_id);
+    info!("Ready – waiting for connections via Cloudflare edge\n");
 
-    // Exponential backoff reconnect loop
+    // Reconnect loop with exponential backoff
     let mut backoff = Duration::from_secs(1);
     let mut addr_idx = 0usize;
 
@@ -127,13 +77,13 @@ async fn run_named_tunnel(cfg: TunnelConfig, creds: TokenCreds) -> Result<()> {
         addr_idx += 1;
 
         info!("Connecting to edge {} …", addr);
-        match named_connect(addr, connector_id, &creds, &cfg.local_url, &connector).await {
+        match connect_and_serve(addr, connector_id, &creds, &cfg.token, &table, &connector).await {
             Ok(()) => {
-                info!("Tunnel session ended cleanly");
+                info!("Connection closed cleanly, reconnecting…");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                warn!("Tunnel error: {}. Reconnecting in {:?} …", e, backoff);
+                warn!("Connection error: {}. Reconnecting in {:?}…", e, backoff);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(64));
             }
@@ -141,128 +91,99 @@ async fn run_named_tunnel(cfg: TunnelConfig, creds: TokenCreds) -> Result<()> {
     }
 }
 
-async fn named_connect(
+// ── Connect + HTTP/2 serve loop ────────────────────────────────────────────
+
+async fn connect_and_serve(
     addr: SocketAddr,
     connector_id: Uuid,
     creds: &TokenCreds,
-    local_url: &str,
+    raw_token: &str,
+    table: &IngressTable,
     connector: &TlsConnector,
 ) -> Result<()> {
     let tcp = TcpStream::connect(addr).await
         .with_context(|| format!("TCP connect to {}", addr))?;
+    tcp.set_nodelay(true)?;
 
-    let domain = rustls::ServerName::try_from(EDGE_SNI)?;
+    let domain = rustls::ServerName::try_from(EDGE_SNI)
+        .map_err(|_| anyhow::anyhow!("Invalid edge SNI"))?;
     let tls = connector.connect(domain, tcp).await
-        .context("TLS handshake")?;
+        .context("TLS handshake failed")?;
 
-    debug!("TLS connected, starting HTTP/2 handshake");
+    // Verify that h2 was negotiated
+    {
+        let (_, session) = tls.get_ref();
+        match session.alpn_protocol() {
+            Some(b"h2") => debug!("ALPN: h2 ✓"),
+            other => warn!("ALPN: {:?} (expected h2)", other.map(|b| String::from_utf8_lossy(b))),
+        }
+    }
+
     let mut h2 = h2::server::handshake(tls).await
-        .context("HTTP/2 handshake")?;
+        .context("HTTP/2 handshake failed")?;
 
     info!("Connected to edge {} ✓", addr);
 
-    serve_h2(&mut h2, connector_id, Some(creds), local_url, addr).await
-}
-
-// ── HTTP/2 server loop ─────────────────────────────────────────────────────
-
-async fn serve_h2<S>(
-    h2: &mut h2::server::Connection<S, Bytes>,
-    connector_id: Uuid,
-    creds: Option<&TokenCreds>,
-    local_url: &str,
-    edge_addr: SocketAddr,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut registered = false;
-
+    // Accept streams from the edge
     loop {
         match h2.accept().await {
-            Some(Ok((req, mut respond))) => {
-                let upgrade_hdr = req
+            Some(Ok((req, respond))) => {
+                let is_control = req
                     .headers()
                     .get(HDR_UPGRADE)
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
+                    .unwrap_or("") == CONTROL_STREAM;
 
-                if upgrade_hdr == CONTROL_STREAM {
-                    // Handle control stream – register the tunnel
-                    debug!("Received control stream from edge");
-                    handle_control_stream(
-                        req,
-                        respond,
-                        connector_id,
-                        creds,
-                        edge_addr,
-                    )
-                    .await?;
-                    registered = true;
-                    info!("Tunnel registered with edge ✓");
+                if is_control {
+                    handle_control_stream(req, respond, connector_id, creds, addr).await?;
+                    info!("Tunnel registered with Cloudflare edge ✓");
                 } else {
-                    // Proxy request to origin
-                    let local_url = local_url.to_string();
+                    let table = Arc::clone(table);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_proxy_stream(req, respond, &local_url).await
-                        {
-                            error!("Proxy error: {}", e);
+                        if let Err(e) = handle_proxy_stream(req, respond, &table).await {
+                            error!("Proxy stream error: {}", e);
                         }
                     });
                 }
             }
-            Some(Err(e)) => {
-                // Connection-level errors
-                if e.is_go_away() {
-                    info!("Edge sent GOAWAY, reconnecting…");
-                    break;
-                }
-                return Err(e.into());
-            }
-            None => {
-                // Connection closed
+            Some(Err(e)) if e.is_go_away() => {
+                info!("Edge sent GOAWAY, reconnecting…");
                 break;
             }
+            Some(Err(e)) => return Err(e.into()),
+            None => break,
         }
     }
 
     Ok(())
 }
 
-// ── Control stream handler ─────────────────────────────────────────────────
+// ── Control stream ─────────────────────────────────────────────────────────
 
 async fn handle_control_stream(
     mut req: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
     connector_id: Uuid,
-    creds: Option<&TokenCreds>,
+    creds: &TokenCreds,
     edge_addr: SocketAddr,
 ) -> Result<()> {
-    // Read request body (edge sends nothing for control stream open)
     let _ = drain_body(req.body_mut()).await;
 
-    // Build registration payload
     let rpc = RegisterConnectionRequest {
-        account_tag: creds.map(|c| c.a.clone()).unwrap_or_default(),
-        tunnel_secret: creds
-            .and_then(|c| c.secret_bytes().ok())
-            .unwrap_or_default(),
+        account_tag: creds.a.clone(),
+        tunnel_secret: creds.secret_bytes().unwrap_or_default(),
         conn_index: 0,
         options: ConnectionOptions {
             client: ClientInfo::new(connector_id),
             num_previous_attempts: 0,
             unregister_pause: 0,
-            features: vec!["ha-origin".into()],
+            features: vec!["ha-origin".into(), "serialized-headers".into()],
         },
-        tunnel_id: creds.map(|c| c.t.clone()).unwrap_or_default(),
+        tunnel_id: creds.t.clone(),
         edge_addr: edge_addr.to_string(),
     };
 
     let body_bytes = Bytes::from(serde_json::to_vec(&rpc)?);
-
-    // Respond 200 OK with registration payload
     let resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
@@ -270,67 +191,73 @@ async fn handle_control_stream(
 
     let mut send = respond.send_response(resp, false)?;
     send.send_data(body_bytes, true)?;
-
     Ok(())
 }
 
-// ── Proxy stream handler ───────────────────────────────────────────────────
+// ── Proxy stream ───────────────────────────────────────────────────────────
 
 async fn handle_proxy_stream(
     mut req: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
-    local_url: &str,
+    table: &IngressTable,
 ) -> Result<()> {
-    debug!("← {} {}", req.method(), req.uri());
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let path = req.uri().path().to_string();
 
-    // Read request body
-    let body = drain_body(req.body_mut()).await;
+    debug!("← {} {} (host: {})", req.method(), path, host);
 
-    // Build http::Request for origin
-    let uri = req.uri().clone();
-    let method = req.method().clone();
-
-    // Deserialize extra response headers from the serialized-headers field
-    let mut origin_req = Request::builder()
-        .method(method)
-        .uri(rewrite_uri(&uri, local_url)?)
-        .version(Version::HTTP_11)
-        .body(body)?;
-
-    // Copy headers
-    for (k, v) in req.headers() {
-        if k == http::header::HOST || k == HDR_UPGRADE {
-            continue;
+    // Match ingress rule
+    let rule = resolve(table, &host, &path).await;
+    let origin_resp = match rule {
+        None => {
+            warn!("No ingress rule matched host={} path={}", host, path);
+            not_found()
         }
-        origin_req.headers_mut().insert(k, v.clone());
-    }
+        Some(rule) => {
+            let body = drain_body(req.body_mut()).await;
 
-    // Forward to origin
-    let origin_resp = forward_http(local_url, origin_req)
-        .await
-        .unwrap_or_else(|e| {
-            warn!("Origin error: {}", e);
-            bad_gateway()
-        });
+            // Build origin request
+            let mut origin_req = Request::builder()
+                .method(req.method())
+                .uri(rewrite_uri(req.uri(), &rule.service)?)
+                .version(Version::HTTP_11)
+                .body(body)?;
+
+            // Copy headers (skip h2 pseudo-headers and hop-by-hop)
+            for (k, v) in req.headers() {
+                let ks = k.as_str();
+                if ks.starts_with(':') || ks == "host" || ks == HDR_UPGRADE {
+                    continue;
+                }
+                origin_req.headers_mut().insert(k, v.clone());
+            }
+
+            dispatch(&rule, origin_req).await.unwrap_or_else(|e| {
+                warn!("Origin error: {}", e);
+                bad_gateway()
+            })
+        }
+    };
 
     let status = origin_resp.status();
     debug!("→ {}", status);
 
-    // Serialize response headers as required by cloudflared protocol
     let (parts, body) = origin_resp.into_parts();
-    let serialized_headers = serialize_headers(&parts.headers);
+    let serialized_hdrs = serialize_headers(&parts.headers);
 
     let mut resp_builder = Response::builder().status(status);
-    // Pass through content-length if present
     if let Some(cl) = parts.headers.get(http::header::CONTENT_LENGTH) {
         resp_builder = resp_builder.header(http::header::CONTENT_LENGTH, cl);
     }
-    // Serialized user headers
-    resp_builder = resp_builder.header(HDR_RESP_HEADERS, serialized_headers);
+    resp_builder = resp_builder.header(HDR_RESP_HEADERS, serialized_hdrs);
 
     let resp = resp_builder.body(())?;
     let mut send = respond.send_response(resp, body.is_empty())?;
-
     if !body.is_empty() {
         send.send_data(body, true)?;
     }
@@ -355,7 +282,6 @@ fn make_tls_config() -> Result<ClientConfig> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    // MUST advertise h2 for HTTP/2
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(cfg)
 }
@@ -374,8 +300,9 @@ async fn drain_body(body: &mut RecvStream) -> Bytes {
     buf.freeze()
 }
 
-fn rewrite_uri(original: &Uri, local_url: &str) -> Result<Uri> {
-    let local = url::Url::parse(local_url)?;
+/// Rewrite URI: replace scheme+host with origin service URL, keep path+query
+fn rewrite_uri(original: &Uri, service_url: &str) -> Result<Uri> {
+    let base = url::Url::parse(service_url)?;
     let path = original
         .path_and_query()
         .map(|p| p.as_str())
@@ -383,22 +310,19 @@ fn rewrite_uri(original: &Uri, local_url: &str) -> Result<Uri> {
 
     let new_uri = format!(
         "{}://{}:{}{}",
-        local.scheme(),
-        local.host_str().unwrap_or("127.0.0.1"),
-        local.port_or_known_default().unwrap_or(80),
+        base.scheme(),
+        base.host_str().unwrap_or("127.0.0.1"),
+        base.port_or_known_default().unwrap_or(80),
         path
     );
     Ok(new_uri.parse()?)
 }
 
-/// Serialize response headers into a single header value
-/// (cloudflared protocol: "Key: Value\r\nKey2: Value2")
+/// Serialize response headers into a single header value for cloudflared protocol
 fn serialize_headers(headers: &HeaderMap) -> String {
     headers
         .iter()
-        .filter(|(k, _)| {
-            *k != http::header::CONTENT_LENGTH
-        })
+        .filter(|(k, _)| *k != http::header::CONTENT_LENGTH)
         .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\r\n")

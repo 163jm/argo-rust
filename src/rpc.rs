@@ -1,13 +1,6 @@
-//! Minimal RPC layer for tunnel registration over the HTTP/2 control stream.
-//!
-//! Real cloudflared uses Cap'n Proto RPC. We implement a JSON-over-HTTP/2
-//! shim that is wire-compatible with the edge's expectations for the
-//! RegisterConnection call.
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Sent by cloudflared → edge to register a connection
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterConnectionRequest {
@@ -19,7 +12,6 @@ pub struct RegisterConnectionRequest {
     pub edge_addr: String,
 }
 
-/// Options negotiated with the edge
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionOptions {
@@ -47,12 +39,4 @@ impl ClientInfo {
             arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         }
     }
-}
-
-/// Response from edge on successful registration
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterConnectionResponse {
-    pub location: Option<String>,
-    pub error: Option<String>,
 }
