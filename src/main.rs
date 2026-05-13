@@ -1,3 +1,4 @@
+mod capnp_rpc;
 mod cf_ca;
 mod config;
 mod edge;
