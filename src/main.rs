@@ -1,3 +1,4 @@
+mod cf_ca;
 mod config;
 mod edge;
 mod ingress;

@@ -31,6 +31,7 @@ dirs-next = "2"
 hex = "0.4"
 
 rustls-native-certs = "0.6"
+rustls-pemfile = "1"
 
 [dependencies.clap]
 version = "=4.4.18"

@@ -290,34 +290,41 @@ async fn handle_proxy_stream(
 fn make_tls_config() -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
 
-    // 1. System cert pool (mirrors x509.SystemCertPool in Go)
+    // 1. Cloudflare's own root CAs (required for h2.cftunnel.com)
+    //    Mirrors cloudflared's GetCloudflareRootCA() in tlsconfig/cloudflare_ca.go
+    let cf_certs = crate::cf_ca::cloudflare_ca_certs();
+    let mut cf_added = 0usize;
+    for cert in &cf_certs {
+        if root_store.add(cert).is_ok() {
+            cf_added += 1;
+        }
+    }
+    info!("Loaded {} Cloudflare root CA cert(s)", cf_added);
+
+    // 2. System cert pool (mirrors x509.SystemCertPool in Go)
     match rustls_native_certs::load_native_certs() {
         Ok(certs) => {
             let mut added = 0usize;
             for cert in certs {
                 let _ = root_store.add(&rustls::Certificate(cert.0)).map(|_| added += 1);
             }
-            debug!("Loaded {} native certs", added);
+            debug!("Loaded {} native system certs", added);
         }
         Err(e) => warn!("Could not load native certs: {}", e),
     }
 
-    // 2. webpki roots as fallback (covers most public CAs)
+    // 3. webpki roots as extra fallback
     root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
         rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
             ta.subject, ta.spki, ta.name_constraints,
         )
     }));
 
+    // NOTE: cloudflared does NOT set ALPN for http2 – edge speaks h2 raw over TLS
     let cfg = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-
-    // NOTE: cloudflared does NOT set ALPN for http2 mode – the edge accepts
-    // the connection and then speaks HTTP/2 directly over the TLS channel.
-    // Setting h2 ALPN might actually cause the handshake to fail if the edge
-    // doesn't advertise h2 in its ServerHello.
 
     Ok(cfg)
 }
