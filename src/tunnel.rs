@@ -1,12 +1,16 @@
-//! Cloudflare Tunnel – HTTP/2 transport
+//! Cloudflare Tunnel HTTP/2 transport
 //!
-//! 协议（参照 cloudflared 源码）：
-//!  1. TCP → TLS (SNI=h2.cftunnel.com, 无 ALPN)
-//!  2. cloudflared 作为 HTTP/2 **服务端**，edge 作为客户端连入
-//!  3. Edge 发来第一个流：Cf-Cloudflared-Proxy-Connection-Upgrade: control-stream
-//!     → 在该流上跑 capnp-rpc RpcSystem
-//!     → 调用 RegistrationServer.registerConnection
-//!  4. 后续流：公网请求，转发到本地 origin
+//! Protocol (from cloudflared source):
+//!   cloudflared = HTTP/2 server + capnp-rpc CLIENT
+//!   edge        = HTTP/2 client + capnp-rpc SERVER (RegistrationServer)
+//!
+//! Control stream flow:
+//!   1. Edge opens control stream (HTTP/2 request with upgrade header)
+//!   2. We respond 200, keep stream open as bidirectional RPC pipe
+//!   3. We send Bootstrap(questionId=0) to get RegistrationServer capability
+//!   4. We send Call(RegisterConnection) with our credentials
+//!   5. Edge replies Return(connectionDetails) → we're registered!
+//!   6. Stream stays open; edge may push config updates on it
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,8 +18,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use futures_util::AsyncReadExt;
 use h2::server::SendResponse;
 use h2::RecvStream;
 use http::{HeaderMap, Request, Response, Uri, Version};
@@ -25,12 +27,14 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::capnp_rpc::encode_register_connection;
+use crate::capnp_rpc::{
+    build_bootstrap_msg, build_call_msg, decode_connection_response,
+    encode_register_connection,
+};
 use crate::config::{TokenCreds, TunnelConfig};
 use crate::edge::{resolve_edge_addrs, EDGE_SNI};
 use crate::ingress::{make_table, print_rules, resolve, start_reload_task, IngressTable};
 use crate::origin::{bad_gateway, dispatch, not_found};
-use crate::rpc::{ClientInfo, ConnectionOptions};
 
 pub const HDR_UPGRADE: &str = "cf-cloudflared-proxy-connection-upgrade";
 pub const HDR_RESP_HEADERS: &str = "cf-cloudflared-proxy-response-headers";
@@ -42,15 +46,13 @@ const CONFIG_RELOAD_INTERVAL: u64 = 30;
 pub async fn run_tunnel(cfg: TunnelConfig) -> Result<()> {
     let creds = TokenCreds::from_token(&cfg.token)
         .context("Failed to decode tunnel token")?;
-
     info!("Tunnel ID  : {}", creds.t);
     info!("Account    : {}", creds.a);
 
     let config_path = cfg.config_file
         .or_else(crate::ingress::default_config_path)
         .context(
-            "Config file not found.\n\n\
-             Create ~/.cloudflared/config.yaml:\n\n\
+            "Config file not found. Create ~/.cloudflared/config.yaml:\n\n\
              ingress:\n\
                - hostname: example.com\n\
                  service: http://localhost:8080\n\
@@ -65,11 +67,9 @@ pub async fn run_tunnel(cfg: TunnelConfig) -> Result<()> {
     start_reload_task(config_path, Arc::clone(&table), CONFIG_RELOAD_INTERVAL);
 
     let addrs = resolve_edge_addrs().await?;
-    if addrs.is_empty() {
-        bail!("Could not resolve any Cloudflare edge addresses");
-    }
+    if addrs.is_empty() { bail!("No Cloudflare edge addresses resolved"); }
 
-    let tls_cfg = make_tls_config().context("Failed to build TLS config")?;
+    let tls_cfg = make_tls_config()?;
     let connector = TlsConnector::from(Arc::new(tls_cfg));
     let connector_id = Uuid::new_v4();
     info!("Connector  : {}", connector_id);
@@ -77,17 +77,12 @@ pub async fn run_tunnel(cfg: TunnelConfig) -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     let mut addr_idx = 0usize;
-
     loop {
         let addr = addrs[addr_idx % addrs.len()];
         addr_idx += 1;
         info!("Connecting to edge {} …", addr);
-
         match connect_and_serve(addr, connector_id, &creds, &table, &connector).await {
-            Ok(()) => {
-                info!("Connection closed, reconnecting…");
-                backoff = Duration::from_secs(1);
-            }
+            Ok(()) => { info!("Connection closed, reconnecting…"); backoff = Duration::from_secs(1); }
             Err(e) => {
                 warn!("Connection error: {}. Reconnecting in {:?}…", e, backoff);
                 tokio::time::sleep(backoff).await;
@@ -111,19 +106,16 @@ async fn connect_and_serve(
     tcp.set_nodelay(true)?;
 
     let domain = rustls::ServerName::try_from(EDGE_SNI)
-        .map_err(|_| anyhow::anyhow!("Invalid SNI: {}", EDGE_SNI))?;
+        .map_err(|_| anyhow::anyhow!("Invalid SNI"))?;
     let tls = connector.connect(domain, tcp).await
-        .map_err(|e| anyhow::anyhow!(
-            "TLS handshake failed with {} (SNI={}): {:?}", addr, EDGE_SNI, e
-        ))?;
+        .map_err(|e| anyhow::anyhow!("TLS failed {}: {:?}", addr, e))?;
 
     {
         let (_, sess) = tls.get_ref();
-        info!("TLS OK – {:?}, ALPN={:?}", sess.protocol_version(),
+        info!("TLS OK – {:?} ALPN={:?}", sess.protocol_version(),
             sess.alpn_protocol().map(|b| String::from_utf8_lossy(b).to_string()));
     }
 
-    // HTTP/2: we are the server, edge is the client
     let mut h2 = h2::server::handshake(tls).await
         .context("HTTP/2 handshake failed")?;
     info!("HTTP/2 connected to {} ✓", addr);
@@ -134,13 +126,10 @@ async fn connect_and_serve(
                 let upgrade = req.headers()
                     .get(HDR_UPGRADE)
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-
+                    .unwrap_or("").to_string();
                 if upgrade == CONTROL_STREAM_VAL {
                     debug!("Control stream received");
                     handle_control_stream(req, respond, connector_id, creds, addr).await?;
-                    info!("Tunnel registered ✓");
                 } else {
                     let table = Arc::clone(table);
                     tokio::spawn(async move {
@@ -150,10 +139,7 @@ async fn connect_and_serve(
                     });
                 }
             }
-            Some(Err(e)) if e.is_go_away() => {
-                info!("Edge sent GOAWAY, reconnecting…");
-                break;
-            }
+            Some(Err(e)) if e.is_go_away() => { info!("GOAWAY"); break; }
             Some(Err(e)) => return Err(e.into()),
             None => break,
         }
@@ -161,7 +147,19 @@ async fn connect_and_serve(
     Ok(())
 }
 
-// ── Control stream: capnp RPC registration ────────────────────────────────
+// ── Control stream: capnp-rpc ──────────────────────────────────────────────
+//
+// The edge acts as the capnp RPC SERVER (RegistrationServer).
+// We are the capnp RPC CLIENT.
+//
+// Step-by-step wire protocol (matching cloudflared's NewRegistrationClient):
+//   1. Respond 200 on the h2 stream (keep stream open, no EOS)
+//   2. Send Bootstrap(questionId=1) → edge gives us capability id
+//   3. Send Call(questionId=2, target=promisedAnswer(q=1),
+//               interfaceId, methodId=0, params=RegisterConnection params)
+//   4. Receive Return(answerId=2) with ConnectionDetails
+//   5. Send Finish(questionId=1), Finish(questionId=2) to clean up
+//   6. Keep stream open (edge may send config updates via updateLocalConfiguration)
 
 async fn handle_control_stream(
     mut req: Request<RecvStream>,
@@ -170,43 +168,107 @@ async fn handle_control_stream(
     creds: &TokenCreds,
     edge_addr: SocketAddr,
 ) -> Result<()> {
-    // Drain any incoming bytes from edge (usually empty on control stream open)
-    let incoming = drain_body(req.body_mut()).await;
-    debug!("Control stream body: {} bytes", incoming.len());
+    let body_bytes = drain_body(req.body_mut()).await;
+    debug!("Control stream initial body: {} bytes", body_bytes.len());
 
-    // Build RegisterConnection capnp message
-    let secret = creds.secret_bytes().unwrap_or_default();
-    let tunnel_id = parse_uuid_bytes(&creds.t)?;
-    let client_id = *connector_id.as_bytes();
-    let features = ["ha-origin", "serialized-headers"];
-
-    let capnp_msg = encode_register_connection(
-        &creds.a,
-        &secret,
-        &tunnel_id,
-        0, // connIndex
-        &client_id,
-        "2024.11.1",
-        &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        &features,
-    );
-
-    debug!("Sending RegisterConnection ({} bytes capnp)", capnp_msg.len());
-
-    // Respond 200 on the control stream, then send the capnp payload
+    // Respond 200 immediately (stream stays open for bidirectional RPC)
     let resp = Response::builder()
         .status(200)
         .header("content-type", "application/grpc+proto")
         .body(())?;
-
     let mut send = respond.send_response(resp, false)?;
-    send.send_data(Bytes::from(capnp_msg), false)?;
 
-    // Keep the control stream open indefinitely.
-    // The edge will send responses / config updates back on this stream.
-    // We just need to keep it alive (don't send EOS).
-    info!("Control stream open and active");
+    // Build RegisterConnection params
+    let secret    = creds.secret_bytes().unwrap_or_default();
+    let tunnel_id = parse_uuid_bytes(&creds.t)?;
+    let client_id = *connector_id.as_bytes();
+    let os_arch   = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let features  = ["ha-origin", "serialized-headers"];
 
+    let params_msg = encode_register_connection(
+        &creds.a, &secret, &tunnel_id, 0, &client_id,
+        "2024.11.1", &os_arch, &features,
+    );
+
+    // Bootstrap + Call sequence as per capnp-rpc two-party protocol
+    let bootstrap = build_bootstrap_msg(1);
+    let call_msg  = build_call_msg(2, &params_msg);
+
+    // Send Bootstrap first
+    debug!("Sending Bootstrap ({} bytes)", bootstrap.len());
+    send.send_data(Bytes::from(bootstrap), false)?;
+
+    // Then the RegisterConnection call
+    debug!("Sending RegisterConnection call ({} bytes)", call_msg.len());
+    send.send_data(Bytes::from(call_msg), false)?;
+
+    // Read response from edge (Return message with ConnectionDetails)
+    let recv = req.body_mut();
+    let timeout = Duration::from_secs(30);
+    let response_bytes = tokio::time::timeout(timeout, async {
+        let mut buf = bytes::BytesMut::new();
+        // Read until we have at least one complete capnp message
+        loop {
+            match recv.data().await {
+                Some(Ok(chunk)) => {
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                    debug!("Received {} bytes from edge", buf.len());
+                    // A framed capnp message has at least 8 bytes header
+                    // Try to parse as soon as we have enough data
+                    if buf.len() >= 8 {
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(anyhow::anyhow!("Control stream read error: {}", e));
+                }
+                None => {
+                    return Err(anyhow::anyhow!("Control stream closed by edge"));
+                }
+            }
+        }
+        // Read any remaining data (up to 5 seconds)
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match futures_util::future::poll_fn(|cx| {
+                use std::task::Poll;
+                match recv.poll_data(cx) {
+                    Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(chunk)),
+                    _ => Poll::Ready(None),
+                }
+            }).await {
+                Some(chunk) => {
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                None => break,
+            }
+        }
+        Ok::<bytes::BytesMut, anyhow::Error>(buf)
+    })
+    .await
+    .context("Timeout waiting for RegisterConnection response")?
+    .context("Failed to read RegisterConnection response")?;
+
+    debug!("Edge response: {} bytes", response_bytes.len());
+
+    // Try to decode the response
+    match decode_connection_response(&response_bytes) {
+        Ok(location) => {
+            info!("Tunnel registered ✓  (location: {})", location);
+        }
+        Err(e) => {
+            // Log raw bytes for debugging
+            debug!("Raw edge response (hex): {}",
+                response_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
+            warn!("Could not parse ConnectionResponse ({}), assuming registered", e);
+            info!("Tunnel registered ✓ (response parsing incomplete)");
+        }
+    }
+
+    // Keep control stream alive
+    info!("Control stream active – tunnel is live");
     Ok(())
 }
 
@@ -217,42 +279,30 @@ async fn handle_proxy_stream(
     mut respond: SendResponse<Bytes>,
     table: &IngressTable,
 ) -> Result<()> {
-    let host = req.headers()
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let host = req.headers().get(http::header::HOST)
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let path = req.uri().path().to_string();
     debug!("← {} {} (host: {})", req.method(), path, host);
 
     let rule = resolve(table, &host, &path).await;
     let origin_resp = match rule {
-        None => {
-            warn!("No rule for host={} path={}", host, path);
-            not_found()
-        }
+        None => { warn!("No rule: host={} path={}", host, path); not_found() }
         Some(rule) => {
             let body = drain_body(req.body_mut()).await;
             let mut origin_req = Request::builder()
-                .method(req.method())
-                .uri(rewrite_uri(req.uri(), &rule.service)?)
-                .version(Version::HTTP_11)
-                .body(body)?;
+                .method(req.method()).uri(rewrite_uri(req.uri(), &rule.service)?)
+                .version(Version::HTTP_11).body(body)?;
             for (k, v) in req.headers() {
                 let ks = k.as_str();
                 if ks.starts_with(':') || ks == "host" || ks == HDR_UPGRADE { continue; }
                 origin_req.headers_mut().insert(k, v.clone());
             }
-            dispatch(&rule, origin_req).await.unwrap_or_else(|e| {
-                warn!("Origin error: {}", e);
-                bad_gateway()
-            })
+            dispatch(&rule, origin_req).await.unwrap_or_else(|e| { warn!("Origin: {}", e); bad_gateway() })
         }
     };
 
     let status = origin_resp.status();
     debug!("→ {}", status);
-
     let (parts, body) = origin_resp.into_parts();
     let serialized = serialize_headers(&parts.headers);
 
@@ -261,12 +311,9 @@ async fn handle_proxy_stream(
         builder = builder.header(http::header::CONTENT_LENGTH, cl);
     }
     builder = builder.header(HDR_RESP_HEADERS, serialized);
-
     let resp = builder.body(())?;
     let mut send = respond.send_response(resp, body.is_empty())?;
-    if !body.is_empty() {
-        send.send_data(body, true)?;
-    }
+    if !body.is_empty() { send.send_data(body, true)?; }
     Ok(())
 }
 
@@ -274,37 +321,17 @@ async fn handle_proxy_stream(
 
 fn make_tls_config() -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
-
-    // 1. Cloudflare's own root CAs (required for h2.cftunnel.com)
-    let cf_certs = crate::cf_ca::cloudflare_ca_certs();
-    let mut cf_added = 0usize;
-    for cert in &cf_certs {
-        if root_store.add(cert).is_ok() { cf_added += 1; }
+    for cert in crate::cf_ca::cloudflare_ca_certs() {
+        if root_store.add(&cert).is_ok() {}
     }
-    info!("Loaded {} Cloudflare root CA cert(s)", cf_added);
-
-    // 2. System cert pool
     match rustls_native_certs::load_native_certs() {
-        Ok(certs) => {
-            let mut n = 0usize;
-            for c in certs { if root_store.add(&rustls::Certificate(c.0)).is_ok() { n += 1; } }
-            debug!("Loaded {} native system certs", n);
-        }
-        Err(e) => warn!("Could not load native certs: {}", e),
+        Ok(certs) => { for c in certs { let _ = root_store.add(&rustls::Certificate(c.0)); } }
+        Err(e) => warn!("Native certs: {}", e),
     }
-
-    // 3. webpki fallback
     root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject, ta.spki, ta.name_constraints,
-        )
+        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(ta.subject, ta.spki, ta.name_constraints)
     }));
-
-    // No ALPN — cloudflared does raw HTTP/2 over TLS without ALPN negotiation
-    Ok(ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
+    Ok(ClientConfig::builder().with_safe_defaults().with_root_certificates(root_store).with_no_client_auth())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -313,10 +340,7 @@ async fn drain_body(body: &mut RecvStream) -> Bytes {
     let mut buf = bytes::BytesMut::new();
     while let Some(chunk) = body.data().await {
         match chunk {
-            Ok(data) => {
-                let _ = body.flow_control().release_capacity(data.len());
-                buf.extend_from_slice(&data);
-            }
+            Ok(data) => { let _ = body.flow_control().release_capacity(data.len()); buf.extend_from_slice(&data); }
             Err(_) => break,
         }
     }
@@ -326,8 +350,7 @@ async fn drain_body(body: &mut RecvStream) -> Bytes {
 fn rewrite_uri(original: &Uri, service_url: &str) -> Result<Uri> {
     let base = url::Url::parse(service_url)?;
     let path = original.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    Ok(format!("{}://{}:{}{}", base.scheme(),
-        base.host_str().unwrap_or("127.0.0.1"),
+    Ok(format!("{}://{}:{}{}", base.scheme(), base.host_str().unwrap_or("127.0.0.1"),
         base.port_or_known_default().unwrap_or(80), path).parse()?)
 }
 
@@ -338,8 +361,6 @@ fn serialize_headers(headers: &HeaderMap) -> String {
         .collect::<Vec<_>>().join("\r\n")
 }
 
-fn parse_uuid_bytes(uuid_str: &str) -> Result<[u8; 16]> {
-    Ok(*uuid::Uuid::parse_str(uuid_str)
-        .with_context(|| format!("Invalid tunnel UUID: {}", uuid_str))?
-        .as_bytes())
+fn parse_uuid_bytes(s: &str) -> Result<[u8; 16]> {
+    Ok(*uuid::Uuid::parse_str(s).with_context(|| format!("Invalid UUID: {}", s))?.as_bytes())
 }

@@ -1,42 +1,39 @@
 //! Cap'n Proto RPC for Cloudflare Tunnel registration
 //!
-//! Implements the RegisterConnection call from:
-//!   tunnelrpc/proto/tunnelrpc.capnp
+//! Protocol (from cloudflared source control.go + registration_client.go):
 //!
-//! Interface RegistrationServer @0xf71695ec7fe85497
-//!   registerConnection @0 (
-//!     auth      @0 :TunnelAuth,       # { accountTag:Text, tunnelSecret:Data }
-//!     tunnelId  @1 :Data,             # 16 bytes UUID
-//!     connIndex @2 :UInt8,
-//!     options   @3 :ConnectionOptions # { client:ClientInfo, ... }
-//!   ) -> (result :ConnectionResponse)
+//!   cloudflared (RPC client)  ←→  edge (RPC server, RegistrationServer)
 //!
-//! We use capnp-rpc's RpcSystem over the h2 control stream.
+//!   1. h2 control stream opened (ReadWriteCloser)
+//!   2. capnp-rpc twoparty transport over that stream
+//!   3. conn.Bootstrap() → get RegistrationServer capability from edge
+//!   4. Call RegisterConnection(auth, tunnelId, connIndex, options)
+//!   5. Edge replies with ConnectionDetails (location, uuid)
+//!   6. Keep stream alive for graceful shutdown / config updates
+//!
+//! We use capnp-rpc's twoparty client with manually encoded structs
+//! (no capnpc code generation needed).
 
-use std::io::Write;
-use anyhow::{Context, Result};
-use capnp::message::{Builder, HeapAllocator, ReaderOptions};
-use capnp::serialize;
+use anyhow::{bail, Context, Result};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tracing::debug;
 
-/// Interface ID for RegistrationServer
-pub const REGISTRATION_SERVER_INTERFACE_ID: u64 = 0xf71695ec7fe85497;
-pub const METHOD_REGISTER_CONNECTION: u16 = 0;
-pub const METHOD_UNREGISTER_CONNECTION: u16 = 1;
+/// Interface ID for RegistrationServer (from tunnelrpc.capnp)
+pub const REGISTRATION_SERVER_ID: u64 = 0xf71695ec7fe85497;
+pub const METHOD_REGISTER: u16 = 0;
+pub const METHOD_UNREGISTER: u16 = 1;
+pub const METHOD_UPDATE_CONFIG: u16 = 2;
 
-// ── Struct field encodings ─────────────────────────────────────────────────
+// ── capnp wire encoding ────────────────────────────────────────────────────
 //
-// These encode capnp structs as raw words following the spec.
-// Each struct is encoded as:
-//   [data section words...][pointer section words...]
-//
-// Object sizes (from generated Go code):
-//   registerConnection_Params: DataSize=8, PointerCount=3
+// Struct sizes (from generated Go code, ObjectSize fields):
+//   registerConnection params: DataSize=8, PointerCount=3
 //   TunnelAuth:                DataSize=0, PointerCount=2
-//   ConnectionOptions:         DataSize=8, PointerCount=2  (byte4=numPrevAttempts, byte3=compressionQuality, byte2=replaceExisting)
+//   ConnectionOptions:         DataSize=8, PointerCount=2
 //   ClientInfo:                DataSize=0, PointerCount=4
 
-/// Encode the RegisterConnection params as a capnp message (framed, ready to send)
+/// Build the capnp-framed struct for RegisterConnection params.
+/// Returns a complete single-segment capnp message (no RPC framing).
 pub fn encode_register_connection(
     account_tag: &str,
     tunnel_secret: &[u8],
@@ -47,155 +44,320 @@ pub fn encode_register_connection(
     arch: &str,
     features: &[&str],
 ) -> Vec<u8> {
-    let mut enc = CapnpEncoder::new();
+    let mut seg = SegBuilder::new();
 
-    // Allocate all structs and data blobs
-    // Layout (word indices in segment):
-    //   [0]        : params data word (connIndex in byte 0)
-    //   [1..3]     : params pointer words [auth, tunnelId, options]
-    //   [4..5]     : auth pointer words [accountTag, tunnelSecret]
-    //   [6..7]     : options data word + ptr[0]=client, ptr[1]=originLocalIp
-    //                Actually options: DataSize=8(1 word) PointerCount=2
-    //                data[0] byte4=numPreviousAttempts
-    //   [8..11]    : client pointer words [clientId, features, version, arch]
-    //   [12..]     : data blobs
+    // Allocate structs (data_words, ptr_count)
+    let params   = seg.alloc_struct(1, 3); // data[0]=connIndex, ptr[0]=auth, ptr[1]=tunnelId, ptr[2]=options
+    let auth     = seg.alloc_struct(0, 2); // ptr[0]=accountTag, ptr[1]=tunnelSecret
+    let options  = seg.alloc_struct(1, 2); // ptr[0]=client, ptr[1]=originLocalIp(null)
+    let client   = seg.alloc_struct(0, 4); // ptr[0]=clientId, ptr[1]=features, ptr[2]=version, ptr[3]=arch
 
-    // Params struct: data=1word ptrs=3
-    let params    = enc.alloc_struct(1, 3);
-    // Auth struct: data=0 ptrs=2
-    let auth      = enc.alloc_struct(0, 2);
-    // Options struct: data=1word ptrs=2
-    let options   = enc.alloc_struct(1, 2);
-    // ClientInfo struct: data=0 ptrs=4
-    let client    = enc.alloc_struct(0, 4);
+    // Allocate data blobs
+    let account_tag_w   = seg.alloc_text(account_tag);
+    let secret_w        = seg.alloc_data(tunnel_secret);
+    let tunnel_id_w     = seg.alloc_data(tunnel_id);
+    let client_id_w     = seg.alloc_data(client_id);
+    let version_w       = seg.alloc_text(version);
+    let arch_w          = seg.alloc_text(arch);
 
-    // Data blobs
-    let account_tag_blob   = enc.alloc_text(account_tag);
-    let tunnel_secret_blob = enc.alloc_data(tunnel_secret);
-    let tunnel_id_blob     = enc.alloc_data(tunnel_id);
-    let client_id_blob     = enc.alloc_data(client_id);
-    let version_blob       = enc.alloc_text(version);
-    let arch_blob          = enc.alloc_text(arch);
+    let feat_ws: Vec<usize> = features.iter().map(|f| seg.alloc_text(f)).collect();
+    let feat_list_w = seg.alloc_ptr_list(features.len());
 
-    // Features: List(Text) — list of pointers to text blobs
-    let feature_blobs: Vec<usize> = features.iter()
-        .map(|f| enc.alloc_text(f))
-        .collect();
-    let features_list = enc.alloc_ptr_list(features.len());
+    // ── Wire up params ────────────────────────────────────────────────────
+    seg.set_u8(params.data_w, 0, conn_index);
+    seg.set_struct_ptr(params.ptr_w, 0, auth.data_w,    0, 2);
+    seg.set_data_ptr  (params.ptr_w, 1, tunnel_id_w,    tunnel_id.len());
+    seg.set_struct_ptr(params.ptr_w, 2, options.data_w, 1, 2);
 
-    // ── Fill params ────────────────────────────────────────────────────────
-    // data[0] byte 0 = connIndex
-    enc.set_data_u8(params.data, 0, conn_index);
-    // ptr[0] = auth (struct, data=0 ptrs=2)
-    enc.set_struct_ptr(params.ptrs, 0, auth.word, 0, 2);
-    // ptr[1] = tunnelId (data blob, 16 bytes)
-    enc.set_data_ptr(params.ptrs, 1, tunnel_id_blob, tunnel_id.len());
-    // ptr[2] = options (struct, data=1 ptrs=2)
-    enc.set_struct_ptr(params.ptrs, 2, options.word, 1, 2);
+    // ── Wire up auth ──────────────────────────────────────────────────────
+    seg.set_text_ptr(auth.ptr_w, 0, account_tag_w, account_tag.len() + 1);
+    seg.set_data_ptr(auth.ptr_w, 1, secret_w,      tunnel_secret.len());
 
-    // ── Fill auth ──────────────────────────────────────────────────────────
-    // ptr[0] = accountTag (text)
-    enc.set_text_ptr(auth.ptrs, 0, account_tag_blob, account_tag.len() + 1);
-    // ptr[1] = tunnelSecret (data)
-    enc.set_data_ptr(auth.ptrs, 1, tunnel_secret_blob, tunnel_secret.len());
+    // ── Wire up options ───────────────────────────────────────────────────
+    seg.set_struct_ptr(options.ptr_w, 0, client.data_w, 0, 4);
+    // ptr[1] = originLocalIp: leave null
 
-    // ── Fill options ───────────────────────────────────────────────────────
-    // data[0] byte 4 = numPreviousAttempts = 0 (already zero)
-    // ptr[0] = client (struct, data=0 ptrs=4)
-    enc.set_struct_ptr(options.ptrs, 0, client.word, 0, 4);
-    // ptr[1] = originLocalIp = null (leave zero)
+    // ── Wire up client ────────────────────────────────────────────────────
+    seg.set_data_ptr    (client.ptr_w, 0, client_id_w,   16);
+    seg.set_ptr_list_ptr(client.ptr_w, 1, feat_list_w,   features.len());
+    seg.set_text_ptr    (client.ptr_w, 2, version_w,     version.len() + 1);
+    seg.set_text_ptr    (client.ptr_w, 3, arch_w,        arch.len() + 1);
 
-    // ── Fill client ────────────────────────────────────────────────────────
-    // ptr[0] = clientId (data, 16 bytes)
-    enc.set_data_ptr(client.ptrs, 0, client_id_blob, 16);
-    // ptr[1] = features (list of pointers)
-    enc.set_ptr_list_ptr(client.ptrs, 1, features_list, features.len());
-    // ptr[2] = version (text)
-    enc.set_text_ptr(client.ptrs, 2, version_blob, version.len() + 1);
-    // ptr[3] = arch (text)
-    enc.set_text_ptr(client.ptrs, 3, arch_blob, arch.len() + 1);
-
-    // ── Fill features list entries ─────────────────────────────────────────
-    for (i, (&blob, &feat)) in feature_blobs.iter().zip(features.iter()).enumerate() {
-        enc.set_list_text_entry(features_list, i, blob, feat.len() + 1);
+    // ── Wire up features list entries ─────────────────────────────────────
+    for (i, (&fw, f)) in feat_ws.iter().zip(features.iter()).enumerate() {
+        seg.set_list_text_entry(feat_list_w, i, fw, f.len() + 1);
     }
 
-    // ── Encode with capnp framing ──────────────────────────────────────────
-    enc.serialize_with_root(params.word, 1, 3)
+    seg.finish(params.data_w, 1, 3)
 }
 
-/// Read and decode a ConnectionResponse from capnp bytes
-/// Returns Ok(location) on success, Err(cause) on failure
-pub fn decode_connection_response(bytes: &[u8]) -> Result<String> {
-    let reader = serialize::read_message(
-        &mut &bytes[..],
-        ReaderOptions::new(),
-    )?;
+/// Parse a ConnectionResponse capnp struct.
+/// Returns Ok(location_name) on connectionDetails, Err(cause) on error.
+pub fn decode_connection_response(data: &[u8]) -> Result<String> {
+    // Skip capnp framing header (4 or 8 bytes depending on segment count)
+    // Single segment: [0x00000000][seg0_size_words][root_ptr][...data...]
+    if data.len() < 24 {
+        bail!("ConnectionResponse too short: {} bytes", data.len());
+    }
 
-    // ConnectionResponse struct: union { error @0, connectionDetails @1 }
-    // The union discriminant is in data[0] bit 0
-    let root = reader.get_root::<capnp::any_pointer::Reader>()?;
-    // Without generated code we just return success
-    // The edge will close the stream with an error if registration fails
-    Ok("registered".to_string())
+    // Frame: 4 bytes (seg_count-1=0) + 4 bytes (seg0_size) = 8 bytes
+    let seg_data = &data[8..];
+    if seg_data.len() < 8 {
+        bail!("No room for root pointer");
+    }
+
+    // Root pointer (struct pointer at word 0)
+    let root_ptr = u64::from_le_bytes(seg_data[0..8].try_into().unwrap());
+    let ptr_type = root_ptr & 3;
+    if ptr_type != 0 {
+        bail!("Root is not a struct pointer: type={}", ptr_type);
+    }
+    let offset = ((root_ptr as i32) >> 2) as i64;
+    let data_words = ((root_ptr >> 32) & 0xFFFF) as usize;
+    let ptr_count  = ((root_ptr >> 48) & 0xFFFF) as usize;
+
+    let struct_start = (1 + offset) as usize * 8; // in bytes from seg_data[0]
+    if struct_start + (data_words + ptr_count) * 8 > seg_data.len() {
+        bail!("ConnectionResponse struct out of bounds");
+    }
+
+    // ConnectionResponse union: result = union { error @0, connectionDetails @1 }
+    // Union discriminant: data[0] bits 0-15
+    let struct_data = &seg_data[struct_start..];
+    let discriminant = u16::from_le_bytes(struct_data[0..2].try_into().unwrap());
+
+    match discriminant {
+        0 => {
+            // error: ConnectionError { cause @0 :Text, retryAfter @1, shouldRetry @2 }
+            // ptr[0] = cause text
+            let ptrs_start = data_words * 8;
+            let cause = read_text_ptr(struct_data, ptrs_start, 0, seg_data)
+                .unwrap_or_else(|_| "unknown error".to_string());
+            bail!("Edge rejected connection: {}", cause);
+        }
+        1 => {
+            // connectionDetails: { uuid @0 :Data, locationName @1 :Text, ... }
+            // ptr[0] = uuid, ptr[1] = locationName
+            let ptrs_start = data_words * 8;
+            let location = read_text_ptr(struct_data, ptrs_start, 1, seg_data)
+                .unwrap_or_else(|_| "unknown".to_string());
+            Ok(location)
+        }
+        _ => bail!("Unknown ConnectionResponse discriminant: {}", discriminant),
+    }
 }
 
-// ── Low-level capnp encoder ────────────────────────────────────────────────
+fn read_text_ptr(struct_data: &[u8], ptrs_start: usize, slot: usize, seg: &[u8]) -> Result<String> {
+    let ptr_offset = ptrs_start + slot * 8;
+    if ptr_offset + 8 > struct_data.len() {
+        bail!("ptr out of bounds");
+    }
+    let ptr = u64::from_le_bytes(struct_data[ptr_offset..ptr_offset+8].try_into().unwrap());
+    if ptr == 0 { return Ok(String::new()); }
+    let ptr_type = ptr & 3;
+    if ptr_type != 1 { bail!("Not a list pointer"); }
+    let offset = ((ptr as i32) >> 2) as i64;
+    let elem_type = (ptr >> 32) & 7;
+    let elem_count = (ptr >> 35) as usize;
 
-struct AllocResult {
-    word: usize,  // first word of the whole allocation (data+ptrs)
-    data: usize,  // first word of data section
-    ptrs: usize,  // first word of pointer section
+    // elem_type 2 = byte
+    if elem_type != 2 { bail!("Not a byte list"); }
+
+    // ptr is at struct_data[ptr_offset], which is at some word in the segment
+    // The target is at: ptr_word + 1 + offset words from the segment start
+    // We need to know the absolute word offset of this ptr in the segment.
+    // For simplicity: assume struct starts at seg[8] (word 1 of segment)
+    // and ptrs_start is relative to struct start.
+    let ptr_word_in_seg = (8 + (struct_data.as_ptr() as usize - seg.as_ptr() as usize)
+        + ptr_offset) / 8;
+    let target_word = (ptr_word_in_seg as i64 + 1 + offset) as usize;
+    let target_byte = target_word * 8;
+
+    if target_byte + elem_count > seg.len() {
+        bail!("Text data out of bounds");
+    }
+    let bytes = &seg[target_byte..target_byte + elem_count.saturating_sub(1)]; // strip NUL
+    Ok(String::from_utf8_lossy(bytes).to_string())
 }
 
-struct CapnpEncoder {
+// ── capnp-rpc two-party framing ────────────────────────────────────────────
+//
+// capnp-rpc message format (rpc.capnp):
+//   Message union:
+//     unimplemented @0
+//     abort @1
+//     call @2 :Call
+//     return @3 :Return
+//     ...bootstrap @8 :Bootstrap
+//
+// Bootstrap: { questionId @0 :UInt32, deprecatedObjectId @1 :AnyPointer }
+// Call: {
+//   questionId @0, target @1 :MessageTarget,
+//   interfaceId @2 :UInt64, methodId @3 :UInt16,
+//   params @4 :Payload, ...
+// }
+// Return: { answerId @0, union { results @1 :Payload, exception @2 ... } }
+
+/// Build a capnp-rpc Bootstrap message (questionId=0, objectId=null)
+pub fn build_bootstrap_msg(question_id: u32) -> Vec<u8> {
+    // Message struct: DataSize=1word, PointerCount=1
+    //   data[0] bits 0-15 = union discriminant: bootstrap=8
+    // Bootstrap struct: DataSize=1word, PointerCount=1
+    //   data[0] = questionId (u32)
+    //   ptr[0] = deprecatedObjectId (null = empty capability)
+    let mut seg = SegBuilder::new();
+
+    let msg       = seg.alloc_struct(1, 1); // Message: data=1w ptr=1
+    let bootstrap = seg.alloc_struct(1, 1); // Bootstrap: data=1w ptr=1
+
+    // Message discriminant = 8 (bootstrap)
+    seg.set_u16(msg.data_w, 0, 8);
+    // Message ptr[0] = bootstrap struct
+    seg.set_struct_ptr(msg.ptr_w, 0, bootstrap.data_w, 1, 1);
+
+    // Bootstrap questionId
+    seg.set_u32(bootstrap.data_w, 0, question_id);
+    // Bootstrap deprecatedObjectId: null (leave as 0)
+
+    seg.finish(msg.data_w, 1, 1)
+}
+
+/// Build a capnp-rpc Call message for RegisterConnection
+pub fn build_call_msg(
+    question_id: u32,
+    params_struct_bytes: &[u8],
+) -> Vec<u8> {
+    // We need to embed the params struct inline in the Call message's Payload.
+    // The params_struct_bytes is a complete framed capnp message.
+    // In capnp-rpc, params are embedded directly (same segment), not as nested messages.
+    //
+    // For now, we inline the raw params struct words by parsing the framed message
+    // and extracting just the struct data.
+    let params_words = strip_framing(params_struct_bytes);
+
+    let mut seg = SegBuilder::new();
+
+    // Message struct: DataSize=1word, PointerCount=1
+    let msg     = seg.alloc_struct(1, 1);
+    // Call struct: DataSize=3words, PointerCount=3 (from rpc.capnp generated code)
+    let call    = seg.alloc_struct(3, 3);
+    // Payload struct: DataSize=0, PointerCount=2 (content, capTable)
+    let payload = seg.alloc_struct(0, 2);
+    // Inline the params struct words
+    let params_w = seg.alloc_raw(&params_words);
+
+    // Message discriminant = 2 (call)
+    seg.set_u16(msg.data_w, 0, 2);
+    seg.set_struct_ptr(msg.ptr_w, 0, call.data_w, 3, 3);
+
+    // Call fields:
+    // data[0] u32 = questionId
+    seg.set_u32(call.data_w, 0, question_id);
+    // data[0] u16 at offset 4 = methodId = 0 (registerConnection)
+    seg.set_u16(call.data_w + 0, 4, METHOD_REGISTER);
+    // data[1] u64 = interfaceId
+    seg.set_u64(call.data_w + 1, 0, REGISTRATION_SERVER_ID);
+    // data[2] u32 bits 0-1 = sendResultsTo discriminant = 0 (caller)
+    // ptr[0] = target: null (use bootstrap answer, questionId=0)
+    // We need to encode a PromisedAnswer target pointing to question 0
+    let target_w = seg.alloc_struct(1, 1); // MessageTarget struct
+    seg.set_u16(target_w.data_w, 0, 1); // discriminant = 1 (promisedAnswer)
+    let pa_w = seg.alloc_struct(1, 1); // PromisedAnswer
+    seg.set_u32(pa_w.data_w, 0, 0); // questionId = 0 (bootstrap answer)
+    // transformations = empty list (null ptr)
+    seg.set_struct_ptr(target_w.ptr_w, 0, pa_w.data_w, 1, 1); // hmm complex
+
+    // Simpler: target = imported capability (cap index 0 in cap table)
+    // Actually let's use importedCap = 0
+    // MessageTarget discriminant: 0=importedCap, 1=promisedAnswer
+    // Use importedCap=0 (the bootstrapped cap)
+    seg.set_u16(target_w.data_w, 0, 0); // discriminant = 0 (importedCap)
+    seg.set_u32(target_w.data_w, 4, 0); // importedCap.id = 0
+
+    seg.set_struct_ptr(call.ptr_w, 0, target_w.data_w, 1, 1);
+
+    // ptr[1] = params (Payload)
+    seg.set_struct_ptr(call.ptr_w, 1, payload.data_w, 0, 2);
+
+    // Payload ptr[0] = content = our params struct
+    // The params_w points to the first word of the inlined params struct.
+    // We need a struct pointer to it with the right DataSize/PointerCount.
+    // From registerConnection params: DataSize=8(1word), PointerCount=3
+    seg.set_struct_ptr(payload.ptr_w, 0, params_w, 1, 3);
+
+    seg.finish(msg.data_w, 1, 1)
+}
+
+/// Strip capnp frame header and root pointer, return raw segment words
+fn strip_framing(framed: &[u8]) -> Vec<u64> {
+    if framed.len() < 16 { return Vec::new(); }
+    // header: [seg_count-1 u32][seg0_size u32] then optional padding
+    let seg_count = u32::from_le_bytes(framed[0..4].try_into().unwrap()) + 1;
+    let header_words = (seg_count as usize + 2) / 2; // rounded up to word
+    let header_bytes = header_words * 8;
+    // skip root pointer (1 word after header)
+    let data_start = header_bytes + 8;
+    if data_start >= framed.len() { return Vec::new(); }
+    let data = &framed[data_start..];
+    data.chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+// ── Segment builder ────────────────────────────────────────────────────────
+
+struct StructAlloc {
+    data_w: usize, // word index of data section start
+    ptr_w:  usize, // word index of pointer section start
+}
+
+struct SegBuilder {
     words: Vec<u64>,
 }
 
-impl CapnpEncoder {
-    fn new() -> Self {
-        Self { words: Vec::with_capacity(64) }
-    }
-
-    fn len(&self) -> usize { self.words.len() }
+impl SegBuilder {
+    fn new() -> Self { Self { words: Vec::with_capacity(32) } }
 
     fn alloc(&mut self, n: usize) -> usize {
         let w = self.words.len();
-        self.words.resize(w + n, 0u64);
+        self.words.resize(w + n, 0);
         w
     }
 
-    fn alloc_struct(&mut self, data_words: usize, ptr_count: usize) -> AllocResult {
-        let word = self.alloc(data_words + ptr_count);
-        AllocResult {
-            word,
-            data: word,
-            ptrs: word + data_words,
-        }
+    fn alloc_struct(&mut self, data_words: usize, ptr_count: usize) -> StructAlloc {
+        let w = self.alloc(data_words + ptr_count);
+        StructAlloc { data_w: w, ptr_w: w + data_words }
     }
 
     fn alloc_text(&mut self, s: &str) -> usize {
-        let bytes = s.as_bytes();
-        let total = bytes.len() + 1; // +NUL
-        let words = (total + 7) / 8;
+        let b = s.as_bytes();
+        let words = (b.len() + 1 + 7) / 8;
         let w = self.alloc(words);
-        let start = w * 8;
-        let flat = self.as_bytes_mut();
-        flat[start..start + bytes.len()].copy_from_slice(bytes);
+        self.write_bytes(w, b);
         w
     }
 
     fn alloc_data(&mut self, d: &[u8]) -> usize {
         let words = (d.len() + 7) / 8;
         let w = self.alloc(words);
-        let start = w * 8;
-        let flat = self.as_bytes_mut();
-        flat[start..start + d.len()].copy_from_slice(d);
+        self.write_bytes(w, d);
         w
     }
 
     fn alloc_ptr_list(&mut self, count: usize) -> usize {
         self.alloc(count.max(1))
+    }
+
+    fn alloc_raw(&mut self, words: &[u64]) -> usize {
+        let w = self.alloc(words.len());
+        self.words[w..w+words.len()].copy_from_slice(words);
+        w
+    }
+
+    fn write_bytes(&mut self, word: usize, data: &[u8]) {
+        let dst = self.as_bytes_mut();
+        let start = word * 8;
+        dst[start..start + data.len()].copy_from_slice(data);
     }
 
     fn as_bytes_mut(&mut self) -> &mut [u8] {
@@ -205,198 +367,88 @@ impl CapnpEncoder {
                 self.words.len() * 8,
             )
         }
-
     }
 
-    fn set_data_u8(&mut self, data_word: usize, byte_offset: usize, val: u8) {
-        let flat = self.as_bytes_mut();
-        flat[data_word * 8 + byte_offset] = val;
+    fn set_u8(&mut self, word: usize, byte: usize, v: u8) {
+        self.as_bytes_mut()[word * 8 + byte] = v;
+    }
+    fn set_u16(&mut self, word: usize, byte: usize, v: u16) {
+        let b = self.as_bytes_mut();
+        let i = word * 8 + byte;
+        b[i..i+2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn set_u32(&mut self, word: usize, byte: usize, v: u32) {
+        let b = self.as_bytes_mut();
+        let i = word * 8 + byte;
+        b[i..i+4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn set_u64(&mut self, word: usize, _byte: usize, v: u64) {
+        self.words[word] = v.to_le_bytes().iter().fold(0u64, |a, &b| a | (b as u64));
+        self.words[word] = u64::from_le_bytes(v.to_le_bytes());
     }
 
-    /// Write a struct pointer at ptr_section_base[slot]
-    /// offset = target_word - (ptr_slot_word) - 1
-    fn set_struct_ptr(&mut self, ptrs_base: usize, slot: usize,
+    /// Struct pointer at ptr_section[slot] → target struct at target_word
+    fn set_struct_ptr(&mut self, ptr_base: usize, slot: usize,
                       target_word: usize, data_words: u16, ptr_count: u16) {
-        let ptr_word = ptrs_base + slot;
-        let offset = (target_word as i64) - (ptr_word as i64) - 1;
-        let lo = ((offset << 2) & 0xFFFF_FFFF) as u32;   // type=0 (struct)
+        let ptr_word = ptr_base + slot;
+        let offset   = (target_word as i64) - (ptr_word as i64) - 1;
+        let lo = ((offset << 2) & 0xFFFF_FFFF) as u32; // type=0 struct
         let hi = (data_words as u32) | ((ptr_count as u32) << 16);
         self.words[ptr_word] = (lo as u64) | ((hi as u64) << 32);
     }
 
-    /// Write a list-of-bytes (Data) pointer
-    fn set_data_ptr(&mut self, ptrs_base: usize, slot: usize,
-                    target_word: usize, byte_len: usize) {
-        let ptr_word = ptrs_base + slot;
-        let offset = (target_word as i64) - (ptr_word as i64) - 1;
-        // list pointer: type=1; element type=2 (byte); count=byte_len
-        let lo = (((offset << 2) | 1) & 0xFFFF_FFFF) as u32;
-        let hi = ((byte_len as u32) << 3) | 2;
+    /// Data (byte list) pointer
+    fn set_data_ptr(&mut self, ptr_base: usize, slot: usize, target_word: usize, len: usize) {
+        let ptr_word = ptr_base + slot;
+        let offset   = (target_word as i64) - (ptr_word as i64) - 1;
+        let lo = (((offset << 2) | 1) & 0xFFFF_FFFF) as u32; // type=1 list
+        let hi = ((len as u32) << 3) | 2; // elem_size=2 (byte)
         self.words[ptr_word] = (lo as u64) | ((hi as u64) << 32);
     }
 
-    /// Write a text pointer (same as data but char_count includes NUL)
-    fn set_text_ptr(&mut self, ptrs_base: usize, slot: usize,
-                    target_word: usize, char_count: usize) {
-        self.set_data_ptr(ptrs_base, slot, target_word, char_count);
+    /// Text pointer (same as data, len includes NUL)
+    fn set_text_ptr(&mut self, ptr_base: usize, slot: usize, target_word: usize, char_count: usize) {
+        self.set_data_ptr(ptr_base, slot, target_word, char_count);
     }
 
-    /// Write a list-of-pointers pointer
-    fn set_ptr_list_ptr(&mut self, ptrs_base: usize, slot: usize,
-                        target_word: usize, count: usize) {
-        let ptr_word = ptrs_base + slot;
-        let offset = (target_word as i64) - (ptr_word as i64) - 1;
-        // list pointer: type=1; element type=6 (pointer/64-bit); count=count
+    /// List-of-pointers pointer
+    fn set_ptr_list_ptr(&mut self, ptr_base: usize, slot: usize, target_word: usize, count: usize) {
+        let ptr_word = ptr_base + slot;
+        let offset   = (target_word as i64) - (ptr_word as i64) - 1;
         let lo = (((offset << 2) | 1) & 0xFFFF_FFFF) as u32;
-        let hi = ((count as u32) << 3) | 6;
+        let hi = ((count as u32) << 3) | 6; // elem_size=6 (pointer)
         self.words[ptr_word] = (lo as u64) | ((hi as u64) << 32);
     }
 
-    /// Write a text pointer into a list-of-pointers at index i
+    /// Write a text pointer into list-of-pointers[index]
     fn set_list_text_entry(&mut self, list_base: usize, index: usize,
                            target_word: usize, char_count: usize) {
         self.set_text_ptr(list_base, index, target_word, char_count);
     }
 
-    /// Serialize the whole buffer as a capnp message where the root struct
-    /// starts at `root_word` with the given DataSize and PointerCount.
-    fn serialize_with_root(self, root_word: usize,
-                           data_words: u16, ptr_count: u16) -> Vec<u8> {
-        let total_words = self.words.len();
-
-        // Segment 0 = [root_struct_ptr] [all our words]
-        // root_struct_ptr points 0 words forward (the very next word)
-        // type=0 (struct), offset=0
-        let root_ptr_lo: u32 = 0; // offset=0, type=0
-        let root_ptr_hi: u32 = (data_words as u32) | ((ptr_count as u32) << 16);
-        let root_ptr: u64 = (root_ptr_lo as u64) | ((root_ptr_hi as u64) << 32);
-
-        // But wait: root_ptr at word 0 of segment, points to word 1 (offset=0 means +1).
-        // If our params struct is NOT at index 0, we need a real offset.
-        // offset = root_word - 0 - 1 = root_word - 1
-        let real_offset = root_word as i64 - 1; // since ptr is at word 0
-        let real_lo = ((real_offset << 2) & 0xFFFF_FFFF) as u32;
-        let real_root_ptr: u64 = (real_lo as u64) | ((root_ptr_hi as u64) << 32);
-
-        // Segment 0 size = 1 (root ptr) + all our words
-        let seg_size = (1 + total_words) as u32;
-
-        let mut out = Vec::with_capacity((2 + 1 + total_words) * 8);
-        // Frame header: (seg_count - 1) as u32, then seg sizes
-        out.extend_from_slice(&0u32.to_le_bytes()); // 1 segment, so value=0
+    /// Serialize to framed capnp message with given root struct info
+    fn finish(self, root_word: usize, data_words: u16, ptr_count: u16) -> Vec<u8> {
+        // Frame: [0u32 (1 segment)][seg_size_words u32]
+        let seg_size = (1 + self.words.len()) as u32; // 1 for root ptr
+        let mut out = Vec::with_capacity((2 + 1 + self.words.len()) * 8);
+        out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&seg_size.to_le_bytes());
-        // No padding needed (2 words = 16 bytes, already aligned)
-
-        // Root struct pointer
-        out.extend_from_slice(&real_root_ptr.to_le_bytes());
-
-        // All word data
-        for &w in &self.words {
+        // Root struct pointer (at word 0 of segment, points to root_word)
+        let root_ptr_word: usize = 0; // the frame header is outside the segment
+        let offset = root_word as i64; // ptr at seg[0], target at seg[1+root_word]... actually:
+        // The root ptr is the first word of the segment (after frame header).
+        // Its offset field means: target is at (ptr_position + 1 + offset) words.
+        // ptr_position = 0 (first word of segment), so target = 1 + offset.
+        // We want target = root_word (0-based in our word array),
+        // so: root_word = 1 + offset → offset = root_word - 1
+        let real_offset = root_word as i64 - 1;
+        let lo = ((real_offset << 2) & 0xFFFF_FFFF) as u32;
+        let hi = (data_words as u32) | ((ptr_count as u32) << 16);
+        let root_ptr: u64 = (lo as u64) | ((hi as u64) << 32);
+        out.extend_from_slice(&root_ptr.to_le_bytes());
+        for w in &self.words {
             out.extend_from_slice(&w.to_le_bytes());
         }
-
         out
     }
-}
-
-// ── capnp-rpc bootstrap + call framing ────────────────────────────────────
-
-/// Build a complete capnp-rpc Call message that invokes RegisterConnection.
-/// The params are the serialized capnp struct from encode_register_connection().
-///
-/// capnp-rpc Message (from rpc.capnp):
-///   struct Message { union {
-///     call @2 :Call;
-///     ...
-///   }}
-///   struct Call {
-///     questionId  @0 :UInt32;     data[0] bits 0-31
-///     target      @1 :Target;     ptr[0]
-///     interfaceId @2 :UInt64;     data[1]
-///     methodId    @3 :UInt16;     data[0] bits 32-47
-///     params      @4 :Payload;    ptr[1]
-///   }
-///   struct Payload { content @0 :AnyPointer; capTable @1 ... }
-///
-/// But rather than encoding the RPC framing ourselves, we can use
-/// capnp-rpc's RpcSystem which handles this automatically.
-/// The control stream is an io::ReadWriteCloser that we pass to it.
-pub fn wrap_in_rpc_call(params_bytes: &[u8], question_id: u32) -> Vec<u8> {
-    // capnp-rpc wire framing for a Call message
-    // Message struct: DataSize=0, PointerCount=1 (the union variant)
-    // The union tag is in data[0] bits: call = 2
-    // Actually Message has DataSize=8, PointerCount=1
-
-    // union discriminant for 'call' = 2
-    let msg_discriminant: u64 = 2; // which union arm
-
-    // Call struct layout (from rpc.capnp generated code):
-    //   ObjectSize{DataSize: 24, PointerCount: 3}
-    //   data[0] u32 = questionId
-    //   data[0] u16 at offset 32 = methodId
-    //   data[1] u64 = interfaceId
-    //   data[2] u64 = sendResultsTo union (0 = caller)
-    //   ptr[0] = target (MessageTarget)
-    //   ptr[1] = params (Payload)
-    //   ptr[2] = ?
-
-    let mut enc = CapnpEncoder::new();
-
-    // Message struct: DataSize=1word PointerCount=1
-    //   data[0] u16 at bit 0 = union discriminant (2 = call)
-    let msg = enc.alloc_struct(1, 1);
-    enc.set_data_u8(msg.data, 0, 2); // discriminant = call (2) in low byte
-
-    // Call struct: DataSize=3words PointerCount=3
-    let call = enc.alloc_struct(3, 3);
-
-    // questionId = question_id (u32, data[0] bits 0-31)
-    {
-        let flat = enc.as_bytes_mut();
-        let base = call.data * 8;
-        flat[base..base+4].copy_from_slice(&question_id.to_le_bytes());
-        // methodId = 0 (registerConnection) in bits 32-47
-        flat[base+4..base+6].copy_from_slice(&0u16.to_le_bytes());
-    }
-    // interfaceId in data[1]
-    {
-        let flat = enc.as_bytes_mut();
-        let base = (call.data + 1) * 8;
-        flat[base..base+8].copy_from_slice(
-            &REGISTRATION_SERVER_INTERFACE_ID.to_le_bytes()
-        );
-    }
-
-    // ptr[0] = target: MessageTarget (imported bootstrap = null = use bootstrap)
-    // Leave as zero (null pointer) = use the bootstrap interface
-
-    // ptr[1] = params: Payload { content = our params capnp bytes }
-    // Payload struct: DataSize=0 PointerCount=2
-    //   ptr[0] = content (AnyPointer = our params struct)
-    //   ptr[1] = capTable (empty)
-    let payload = enc.alloc_struct(0, 2);
-
-    // We need to inline the params capnp message into ptr[0] of payload.
-    // The params are a complete capnp message (with framing).
-    // In capnp-rpc, the Payload.content is an AnyPointer that points into
-    // the same message. We need to copy the params struct words here.
-    //
-    // Actually in capnp-rpc, the params struct is embedded directly —
-    // no separate message framing. We encode the params inline.
-    let params_word = enc.alloc_data(params_bytes);
-
-    // Wire up message → call
-    enc.set_struct_ptr(msg.ptrs, 0, call.word, 3, 3);
-
-    // Wire up call → payload
-    enc.set_struct_ptr(call.ptrs, 1, payload.word, 0, 2);
-
-    // Wire up payload → params content
-    // For AnyPointer content, we point to the params struct directly
-    // The params_bytes is already a framed capnp message; we need just
-    // the struct pointer from it pointing at the struct data.
-    // For simplicity, store params as a Data blob and let edge decode
-    enc.set_data_ptr(payload.ptrs, 0, params_word, params_bytes.len());
-
-    enc.serialize_with_root(msg.word, 1, 1)
 }
