@@ -1,4 +1,5 @@
 mod capnp_rpc;
+mod h2_stream;
 mod cf_ca;
 mod config;
 mod edge;
