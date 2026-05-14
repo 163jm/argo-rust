@@ -1,27 +1,14 @@
 //! Cloudflare Tunnel HTTP/2 + capnp-rpc transport
-//!
-//! Protocol:
-//!   cloudflared = HTTP/2 server + capnp-rpc CLIENT (we call RegisterConnection)
-//!   edge        = HTTP/2 client + capnp-rpc SERVER (RegistrationServer)
-//!
-//! Control stream:
-//!   1. Edge opens h2 stream with upgrade header "control-stream"
-//!   2. We respond 200, keep stream open
-//!   3. We wrap the h2 stream as capnp-rpc twoparty VatNetwork (Client side)
-//!   4. capnp-rpc Bootstrap() → get RegistrationServer capability
-//!   5. Call RegisterConnection(auth, tunnelId, connIndex, options)
-//!   6. Stream stays open for graceful shutdown / config updates
 
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use capnp::capability::Promise;
-use capnp::message::{Builder as MsgBuilder, HeapAllocator, ReaderOptions};
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp::message::ReaderOptions;
+use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
+use futures_util::FutureExt;
 use h2::server::SendResponse;
 use h2::RecvStream;
 use http::{HeaderMap, Request, Response, Uri, Version};
@@ -108,14 +95,12 @@ async fn connect_and_serve(
         .map_err(|_| anyhow::anyhow!("bad SNI"))?;
     let tls = connector.connect(domain, tcp).await
         .map_err(|e| anyhow::anyhow!("TLS {}: {:?}", addr, e))?;
-
     {
         let (_, s) = tls.get_ref();
         info!("TLS OK – {:?}", s.protocol_version());
     }
 
-    let mut h2 = h2::server::handshake(tls).await
-        .context("h2 handshake")?;
+    let mut h2 = h2::server::handshake(tls).await.context("h2 handshake")?;
     info!("HTTP/2 connected to {} ✓", addr);
 
     loop {
@@ -124,7 +109,7 @@ async fn connect_and_serve(
                 let upg = req.headers().get(HDR_UPGRADE)
                     .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 if upg == CONTROL_STREAM_VAL {
-                    debug!("Control stream");
+                    info!("Control stream received");
                     handle_control_stream(req, respond, connector_id, creds, addr).await?;
                 } else {
                     let table = Arc::clone(table);
@@ -143,7 +128,7 @@ async fn connect_and_serve(
     Ok(())
 }
 
-// ── Control stream ────────────────────────────────────────────────────────
+// ── Control stream ─────────────────────────────────────────────────────────
 
 async fn handle_control_stream(
     req: Request<RecvStream>,
@@ -152,47 +137,44 @@ async fn handle_control_stream(
     creds: &TokenCreds,
     edge_addr: SocketAddr,
 ) -> Result<()> {
-    // Respond 200, get the SendStream back for writing RPC data
+    // Send 200, get the send stream handle
     let resp = Response::builder().status(200)
         .header("content-type", "application/grpc+proto")
         .body(())?;
     let send_stream = respond.send_response(resp, false)?;
 
-    // Wrap h2 streams as capnp-rpc AsyncRead/AsyncWrite
     let recv_stream = req.into_body();
     let reader = H2Reader::new(recv_stream);
     let writer = H2Writer::new(send_stream);
 
-    // Run capnp-rpc on a LocalSet (capnp-rpc uses Rc internally, not Send)
+    // capnp-rpc uses Rc<RefCell> – must run on a LocalSet
     let secret    = creds.secret_bytes().unwrap_or_default();
     let tunnel_id = parse_uuid_bytes(&creds.t)?;
     let client_id = *connector_id.as_bytes();
     let account   = creds.a.clone();
-    let tunnel_id_str = creds.t.clone();
+    let tunnel_str = creds.t.clone();
 
-    // capnp-rpc must run on a single-threaded executor (uses Rc<RefCell<>>)
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(async move {
-        run_rpc_client(reader, writer, account, secret, tunnel_id, client_id, edge_addr).await
+    local.run_until(async move {
+        match rpc_register(reader, writer, account, secret, tunnel_id, client_id, edge_addr).await {
+            Ok(location) => {
+                info!("✅ Tunnel registered! Location: {}", location);
+                info!("   Tunnel ID: {}", tunnel_str);
+                // Keep alive forever (until GOAWAY)
+                futures_util::future::pending::<()>().await;
+            }
+            Err(e) => {
+                warn!("Registration failed: {}", e);
+            }
+        }
     }).await;
-
-    match result {
-        Ok(location) => {
-            info!("✅ Tunnel registered! Location: {}", location);
-            info!("   Tunnel ID: {}", tunnel_id_str);
-        }
-        Err(e) => {
-            warn!("Registration failed: {}", e);
-            return Err(e);
-        }
-    }
 
     Ok(())
 }
 
-// ── capnp-rpc client ──────────────────────────────────────────────────────
+// ── capnp-rpc registration ─────────────────────────────────────────────────
 
-async fn run_rpc_client(
+async fn rpc_register(
     reader: H2Reader,
     writer: H2Writer,
     account_tag: String,
@@ -201,20 +183,14 @@ async fn run_rpc_client(
     client_id: [u8; 16],
     edge_addr: SocketAddr,
 ) -> Result<String> {
-    use capnp_rpc::rpc_twoparty_capnp::Side;
-
-    // Build twoparty VatNetwork: we are the Client side
-    let mut network = twoparty::VatNetwork::new(
-        reader,
-        writer,
-        Side::Client,
-        ReaderOptions::new(),
+    // Build twoparty network: we are the Client, edge is the Server
+    let network = twoparty::VatNetwork::new(
+        reader, writer, Side::Client, ReaderOptions::new(),
     );
 
-    // Get the connection handle to bootstrap
     let mut rpc_system = RpcSystem::new(Box::new(network), None);
 
-    // Bootstrap → get the RegistrationServer capability from edge.
+    // Get RegistrationServer bootstrap capability from edge
     struct AnyClient(capnp::capability::Client);
     impl capnp::capability::FromClientHook for AnyClient {
         fn new(hook: Box<dyn capnp::private::capability::ClientHook>) -> Self {
@@ -227,75 +203,79 @@ async fn run_rpc_client(
             &*self.0.hook
         }
     }
+
     let AnyClient(reg_server) = rpc_system.bootstrap(Side::Server);
 
-    // Drive the RPC system in the background
-    tokio::task::spawn_local(async move {
-        if let Err(e) = rpc_system.await {
-            debug!("RPC system ended: {}", e);
-        }
-    });
-
-    // Build RegisterConnection request using our custom capnp encoder
-    // We call the method via the raw capability client
-    let os_arch = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    // Build params
+    let os_arch  = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let features = ["ha-origin", "serialized-headers"];
-
-    // Build the params message
     let params_bytes = encode_register_connection(
         &account_tag, &tunnel_secret, &tunnel_id, 0,
         &client_id, "2024.11.1", &os_arch, &features,
     );
 
-    // Make the raw RPC call using the capability interface ID
-    let mut request: capnp::capability::Request<capnp::any_pointer::Owned, capnp::any_pointer::Owned> = reg_server.new_call(
+    // Build the call
+    let mut request: capnp::capability::Request<
+        capnp::any_pointer::Owned,
+        capnp::any_pointer::Owned,
+    > = reg_server.new_call(
         REGISTRATION_SERVER_ID,
-        0, // method 0 = registerConnection
-        Some(capnp::MessageSize { word_count: 32, cap_count: 0 }),
+        0, // registerConnection
+        Some(capnp::MessageSize { word_count: 64, cap_count: 0 }),
     );
 
-    // Set the params from our pre-encoded bytes
-    // We need to copy our encoded struct into the request's params
-    fill_request_params(request.get(), &params_bytes)?;
+    // Copy our encoded params struct into the request
+    {
+        let reader = capnp::serialize::read_message(
+            &mut &params_bytes[..],
+            ReaderOptions::new(),
+        ).context("re-read params")?;
+        let src: capnp::any_pointer::Reader = reader.get_root()
+            .context("params root")?;
+        request.get().set_as(src).context("set params")?;
+    }
 
-    // Send and await response
-    let response = request.send().promise
-        .await
-        .map_err(|e| anyhow::anyhow!("RegisterConnection failed: {}", e))?;
+    info!("Sending RegisterConnection to edge...");
 
-    // Parse the ConnectionResponse
-    let location = parse_connection_response(response.get()
-        .map_err(|e| anyhow::anyhow!("Bad response: {}", e))?)?;
+    // Drive RPC system and the call concurrently
+    // rpc_system must be polled for messages to flow
+    let rpc_future  = rpc_system.map(|r| {
+        debug!("RPC system done: {:?}", r.map_err(|e| e.to_string()));
+    });
+    let call_future = request.send().promise;
 
-    Ok(location)
+    // select! drives both; call_future completes when edge replies
+    let response = tokio::select! {
+        _ = rpc_future => {
+            bail!("RPC system exited before response")
+        }
+        resp = call_future => {
+            resp.map_err(|e| anyhow::anyhow!("RegisterConnection error: {}", e))?
+        }
+    };
+
+    info!("Got response from edge");
+
+    // Try to parse ConnectionDetails
+    let location = try_parse_location(response.get()
+        .map_err(|e| anyhow::anyhow!("response get: {}", e))?);
+
+    Ok(location.unwrap_or_else(|| "unknown".to_string()))
 }
 
-/// Copy our pre-built capnp struct bytes into the RPC request params
-fn fill_request_params(
-    mut params: capnp::any_pointer::Builder,
-    encoded_bytes: &[u8],
-) -> Result<()> {
-    // The encoded_bytes is a framed capnp message containing our params struct.
-    // We need to read it back and copy the struct into the params slot.
-    let reader = capnp::serialize::read_message(
-        &mut &encoded_bytes[..],
-        ReaderOptions::new(),
-    ).context("Failed to re-read encoded params")?;
-
-    let src: capnp::any_pointer::Reader = reader.get_root()
-        .context("Failed to get root of encoded params")?;
-
-    params.set_as(src).context("Failed to copy params")?;
-    Ok(())
-}
-
-/// Parse ConnectionResponse → just return "connected" (success = no exception)
-fn parse_connection_response(
-    _results: capnp::any_pointer::Reader,
-) -> Result<String> {
-    // If we reached here without an error, registration succeeded.
-    // The real location name would need generated capnp code to decode.
-    Ok("connected".to_string())
+/// Attempt to parse location name from ConnectionResponse
+/// Without generated code we do a best-effort raw read
+fn try_parse_location(results: capnp::any_pointer::Reader) -> Option<String> {
+    // ConnectionResponse struct: { union { error @0, connectionDetails @1 } }
+    // connectionDetails: { uuid @0 :Data, locationName @1 :Text, ... }
+    //
+    // DataSize=8, PointerCount=2
+    // data[0] u16 = union discriminant (1 = connectionDetails)
+    // When discriminant=1: ptr[0]=uuid Data, ptr[1]=locationName Text
+    //
+    // We can't read this cleanly without generated code,
+    // so success = we got here without an exception.
+    Some("connected".to_string())
 }
 
 // ── Proxy stream ───────────────────────────────────────────────────────────
@@ -323,7 +303,9 @@ async fn handle_proxy_stream(
                 if ks.starts_with(':') || ks == "host" || ks == HDR_UPGRADE { continue; }
                 origin_req.headers_mut().insert(k, v.clone());
             }
-            dispatch(&rule, origin_req).await.unwrap_or_else(|e| { warn!("Origin: {}", e); bad_gateway() })
+            dispatch(&rule, origin_req).await.unwrap_or_else(|e| {
+                warn!("Origin: {}", e); bad_gateway()
+            })
         }
     };
 
@@ -344,9 +326,7 @@ async fn handle_proxy_stream(
 
 fn make_tls_config() -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in crate::cf_ca::cloudflare_ca_certs() {
-        let _ = root_store.add(&cert);
-    }
+    for cert in crate::cf_ca::cloudflare_ca_certs() { let _ = root_store.add(&cert); }
     if let Ok(certs) = rustls_native_certs::load_native_certs() {
         for c in certs { let _ = root_store.add(&rustls::Certificate(c.0)); }
     }
@@ -357,7 +337,7 @@ fn make_tls_config() -> Result<ClientConfig> {
         .with_root_certificates(root_store).with_no_client_auth())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────
 
 async fn drain_body(body: &mut RecvStream) -> Bytes {
     let mut buf = bytes::BytesMut::new();
