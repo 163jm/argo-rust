@@ -1,4 +1,5 @@
 mod capnp_rpc;
+mod tunnelrpc_capnp;
 mod h2_stream;
 mod cf_ca;
 mod config;

@@ -183,99 +183,98 @@ async fn rpc_register(
     client_id: [u8; 16],
     edge_addr: SocketAddr,
 ) -> Result<String> {
+    use crate::tunnelrpc_capnp::registration_server;
+
     // Build twoparty network: we are the Client, edge is the Server
     let network = twoparty::VatNetwork::new(
         reader, writer, Side::Client, ReaderOptions::new(),
     );
-
     let mut rpc_system = RpcSystem::new(Box::new(network), None);
 
-    // Get RegistrationServer bootstrap capability from edge
-    struct AnyClient(capnp::capability::Client);
-    impl capnp::capability::FromClientHook for AnyClient {
-        fn new(hook: Box<dyn capnp::private::capability::ClientHook>) -> Self {
-            AnyClient(capnp::capability::Client::new(hook))
-        }
-        fn into_client_hook(self) -> Box<dyn capnp::private::capability::ClientHook> {
-            self.0.hook
-        }
-        fn as_client_hook(&self) -> &dyn capnp::private::capability::ClientHook {
-            &*self.0.hook
-        }
-    }
+    // Bootstrap: get the RegistrationServer capability from edge
+    // registration_server::Client implements FromClientHook (generated code)
+    let reg_server: registration_server::Client = rpc_system.bootstrap(Side::Server);
 
-    let AnyClient(reg_server) = rpc_system.bootstrap(Side::Server);
+    // Build a typed RegisterConnection request
+    let mut request = reg_server.register_connection_request();
 
-    // Build params
-    let os_arch  = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let features = ["ha-origin", "serialized-headers"];
-    let params_bytes = encode_register_connection(
-        &account_tag, &tunnel_secret, &tunnel_id, 0,
-        &client_id, "2024.11.1", &os_arch, &features,
-    );
-
-    // Build the call
-    let mut request: capnp::capability::Request<
-        capnp::any_pointer::Owned,
-        capnp::any_pointer::Owned,
-    > = reg_server.new_call(
-        REGISTRATION_SERVER_ID,
-        0, // registerConnection
-        Some(capnp::MessageSize { word_count: 64, cap_count: 0 }),
-    );
-
-    // Copy our encoded params struct into the request
+    // Fill params using generated typed builders
     {
-        let reader = capnp::serialize::read_message(
-            &mut &params_bytes[..],
-            ReaderOptions::new(),
-        ).context("re-read params")?;
-        let src: capnp::any_pointer::Reader = reader.get_root()
-            .context("params root")?;
-        request.get().set_as(src).context("set params")?;
+        let mut p = request.get();
+
+        // auth: TunnelAuth { accountTag, tunnelSecret }
+        let mut auth = p.reborrow().init_auth();
+        auth.set_account_tag(account_tag.as_str().into());
+        auth.set_tunnel_secret(&tunnel_secret);
+
+        // tunnelId: 16-byte UUID
+        p.reborrow().set_tunnel_id(&tunnel_id);
+
+        // connIndex
+        p.reborrow().set_conn_index(0);
+
+        // options: ConnectionOptions
+        let mut opts = p.init_options();
+        opts.set_num_previous_attempts(0);
+
+        // client: ClientInfo
+        let mut client = opts.init_client();
+        client.set_client_id(&client_id);
+
+        let os_arch = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let features = ["ha-origin", "serialized-headers"];
+
+        // features: List(Text)
+        let mut feat_list = client.reborrow().init_features(features.len() as u32);
+        for (i, &f) in features.iter().enumerate() {
+            feat_list.set(i as u32, f.into());
+        }
+
+        client.set_version("2024.11.1".into());
+        client.set_arch(os_arch.as_str().into());
     }
 
     info!("Sending RegisterConnection to edge...");
 
-    // Drive RPC system and the call concurrently
-    // rpc_system must be polled for messages to flow
-    let rpc_future  = rpc_system.map(|r| {
-        debug!("RPC system done: {:?}", r.map_err(|e| e.to_string()));
-    });
+    // Drive RPC + call concurrently (rpc_system must be polled for messages to flow)
+    let rpc_future  = rpc_system.map(|r| debug!("RPC done: {:?}", r.map_err(|e| e.to_string())));
     let call_future = request.send().promise;
 
-    // select! drives both; call_future completes when edge replies
     let response = tokio::select! {
-        _ = rpc_future => {
-            bail!("RPC system exited before response")
-        }
-        resp = call_future => {
-            resp.map_err(|e| anyhow::anyhow!("RegisterConnection error: {}", e))?
-        }
+        _ = rpc_future => bail!("RPC system exited before response"),
+        resp = call_future => resp.map_err(|e| anyhow::anyhow!("RegisterConnection: {}", e))?,
     };
 
     info!("Got response from edge");
 
-    // Try to parse ConnectionDetails
-    let location = try_parse_location(response.get()
-        .map_err(|e| anyhow::anyhow!("response get: {}", e))?);
+    // Parse ConnectionResponse using generated types
+    let results = response.get()
+        .map_err(|e| anyhow::anyhow!("response.get: {}", e))?;
 
-    Ok(location.unwrap_or_else(|| "unknown".to_string()))
-}
+    // results is register_connection_results::Reader
+    // It has get_result() → connection_response::Reader
+    // which has get_result() → connection_response::result::Reader (the union)
+    let conn_resp = results.get_result()
+        .map_err(|e| anyhow::anyhow!("get_result: {}", e))?;
+    let result_reader = conn_resp.get_result();
 
-/// Attempt to parse location name from ConnectionResponse
-/// Without generated code we do a best-effort raw read
-fn try_parse_location(results: capnp::any_pointer::Reader) -> Option<String> {
-    // ConnectionResponse struct: { union { error @0, connectionDetails @1 } }
-    // connectionDetails: { uuid @0 :Data, locationName @1 :Text, ... }
-    //
-    // DataSize=8, PointerCount=2
-    // data[0] u16 = union discriminant (1 = connectionDetails)
-    // When discriminant=1: ptr[0]=uuid Data, ptr[1]=locationName Text
-    //
-    // We can't read this cleanly without generated code,
-    // so success = we got here without an exception.
-    Some("connected".to_string())
+    use crate::tunnelrpc_capnp::connection_response::result::Which;
+    match result_reader.which().map_err(|e| anyhow::anyhow!("which: {}", e))? {
+        Which::Error(e) => {
+            let err = e.map_err(|e| anyhow::anyhow!("error read: {}", e))?;
+            let cause = err.get_cause()
+                .map(|c| c.to_str().unwrap_or("").to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            bail!("Edge rejected registration: {}", cause);
+        }
+        Which::ConnectionDetails(d) => {
+            let details = d.map_err(|e| anyhow::anyhow!("details read: {}", e))?;
+            let location = details.get_location_name()
+                .map(|l| l.to_str().unwrap_or("").to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            Ok(location)
+        }
+    }
 }
 
 // ── Proxy stream ───────────────────────────────────────────────────────────
