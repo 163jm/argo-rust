@@ -1,15 +1,14 @@
-//! Wrap h2 RecvStream + SendStream into AsyncRead + AsyncWrite
-//! so capnp-rpc's VatNetwork can use them directly.
+//! Wrap h2 RecvStream + SendStream as futures AsyncRead + AsyncWrite
+//! for capnp-rpc VatNetwork.
 
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::AsyncRead as FuturesAsyncRead;
-use futures_util::AsyncWrite as FuturesAsyncWrite;
+use futures_util::AsyncRead;
+use futures_util::AsyncWrite;
 use h2::{RecvStream, SendStream};
-use tracing::debug;
 
 /// AsyncRead wrapper around h2::RecvStream
 pub struct H2Reader {
@@ -23,7 +22,7 @@ impl H2Reader {
     }
 }
 
-impl FuturesAsyncRead for H2Reader {
+impl AsyncRead for H2Reader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -37,13 +36,12 @@ impl FuturesAsyncRead for H2Reader {
             return Poll::Ready(Ok(n));
         }
 
-        // Poll h2 for next chunk
         match self.recv.poll_data(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(Ok(0)), // EOF
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))
-            }
+            Poll::Ready(None) => Poll::Ready(Ok(0)),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
+            )),
             Poll::Ready(Some(Ok(data))) => {
                 let _ = self.recv.flow_control().release_capacity(data.len());
                 let n = out.len().min(data.len());
@@ -58,6 +56,9 @@ impl FuturesAsyncRead for H2Reader {
 }
 
 /// AsyncWrite wrapper around h2::SendStream<Bytes>
+///
+/// send_data() can be called without reserving capacity — h2 buffers it
+/// and sends when flow control window opens. This is the correct approach.
 pub struct H2Writer {
     send: SendStream<Bytes>,
 }
@@ -68,32 +69,20 @@ impl H2Writer {
     }
 }
 
-impl FuturesAsyncWrite for H2Writer {
+impl AsyncWrite for H2Writer {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Reserve capacity
-        match self.send.poll_capacity(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(None) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "h2 send stream closed",
-                )));
-            }
-            Poll::Ready(Some(Err(e))) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())));
-            }
-            Poll::Ready(Some(Ok(n))) => {
-                let to_send = n.min(buf.len());
-                let data = Bytes::copy_from_slice(&buf[..to_send]);
-                self.send
-                    .send_data(data, false)
-                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-                return Poll::Ready(Ok(to_send));
-            }
+        // send_data buffers internally if no flow-control window is available.
+        // This is safe and correct — h2 will flush when window opens.
+        let data = Bytes::copy_from_slice(buf);
+        match self.send.send_data(data, false) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(e) => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
+            )),
         }
     }
 
@@ -101,10 +90,9 @@ impl FuturesAsyncWrite for H2Writer {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.send
-            .send_data(Bytes::new(), true)
-            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-        Poll::Ready(Ok(()))
+    fn poll_close(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.send.send_data(Bytes::new(), true) {
+            Ok(()) | Err(_) => Poll::Ready(Ok(())),
+        }
     }
 }
